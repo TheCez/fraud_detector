@@ -61,6 +61,13 @@ _GERMAN_DATE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$")
 # German number with comma decimal: 1.234,56 or just 1234,56
 _GERMAN_NUMBER_RE = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d{1,2}$")
 
+# Header detection bounds - see _detect_header_row for the full heuristic.
+_MAX_HEADER_SCAN_ROWS = 15
+_MIN_HEADER_NON_EMPTY_CELLS = 2
+_MIN_HEADER_FILL_RATIO = 0.5
+_MIN_HEADER_TEXT_RATIO = 0.8
+_MIN_HEADER_UNIQUE_RATIO = 0.8
+
 
 def _make_record_id(dossier_id: str, file_id: str, row: int, index: int) -> str:
     """Generate stable UUID5 for a record."""
@@ -147,12 +154,93 @@ def _normalize_cell_value(value) -> str | int | float | None:
     return str(value)
 
 
+def _detect_header_row(rows: list[tuple]) -> int | None:
+    """
+    Find the real header row within the first rows of a sheet.
+
+    Real-world GDPdU/GoBD exports routinely stack a company/report banner
+    line and a blank spacer row above the actual column header, so `rows[0]`
+    is almost never the header. This scans only the first
+    `_MAX_HEADER_SCAN_ROWS` rows (bounded - it never reads the whole sheet)
+    and returns the 0-based index of the first row that looks like a header,
+    or `None` if no row qualifies.
+
+    A row qualifies as a header when all of these hold:
+      - it has at least `_MIN_HEADER_NON_EMPTY_CELLS` non-empty cells, which
+        rules out single-cell banner/section-label rows and blank spacers;
+      - its fill ratio (non-empty cells / total columns) is at least
+        `_MIN_HEADER_FILL_RATIO` - header rows are fully populated, banners
+        are one cell wide in a many-column sheet;
+      - its text ratio (non-empty cells that normalize to strings rather
+        than numbers or dates) is at least `_MIN_HEADER_TEXT_RATIO` - column
+        names are labels, not data values; this is what rejects data rows
+        that happen to be dense and mostly-unique;
+      - its uniqueness ratio (distinct values / non-empty cells) is at least
+        `_MIN_HEADER_UNIQUE_RATIO` - column names don't repeat within a row.
+
+    The first qualifying row is returned rather than the best-scoring one:
+    a sheet has one header, and it always precedes the data it describes, so
+    the earliest match in scan order is correct by construction once the
+    thresholds above have filtered out banners and spacers.
+
+    Failure mode: sheets with no row meeting all four thresholds in the
+    scanned window return `None`. This is a deliberate outcome, not an
+    error - it covers label/value reconciliation sheets that have no
+    tabular header at all (e.g. two-column "metric -> amount" sheets), and
+    also covers headers that start deeper than `_MAX_HEADER_SCAN_ROWS`, which
+    this heuristic does not support. Callers must fall back to positional
+    `column_N` names in both cases and must not run entity-extraction
+    heuristics that assume a real header column name.
+    """
+    scan_limit = min(len(rows), _MAX_HEADER_SCAN_ROWS)
+    for idx in range(scan_limit):
+        row = rows[idx]
+        total_columns = len(row)
+        if total_columns == 0:
+            continue
+
+        non_empty_values = [
+            value
+            for value in (_normalize_cell_value(cell) for cell in row)
+            if value is not None and value != ""
+        ]
+        if len(non_empty_values) < _MIN_HEADER_NON_EMPTY_CELLS:
+            continue
+
+        fill_ratio = len(non_empty_values) / total_columns
+        if fill_ratio < _MIN_HEADER_FILL_RATIO:
+            continue
+
+        text_count = sum(1 for value in non_empty_values if isinstance(value, str))
+        text_ratio = text_count / len(non_empty_values)
+        if text_ratio < _MIN_HEADER_TEXT_RATIO:
+            continue
+
+        unique_count = len({str(value) for value in non_empty_values})
+        unique_ratio = unique_count / len(non_empty_values)
+        if unique_ratio < _MIN_HEADER_UNIQUE_RATIO:
+            continue
+
+        return idx
+
+    return None
+
+
 def _extract_entities(
     row_data: dict[str, str | int | float | None],
     headers: list[str],
-    entity_strategy: str,
+    entity_strategy: str | None,
 ) -> list[EntityRef]:
-    """Extract entity references from a row based on column names."""
+    """
+    Extract entity references from a row based on column names.
+
+    `entity_strategy` is `None` when no real header row was detected for the
+    sheet: without genuine column names, `headers[0]` is a synthetic
+    `column_0` placeholder, and the positional "first column is the entity
+    id" fallback below would misfire on arbitrary label text. Column-name
+    pattern matches still run in that case but naturally find nothing, since
+    patterns like `_ACCOUNT_COLUMNS` never match `column_N`.
+    """
     entities: list[EntityRef] = []
     seen: set[tuple[str, str]] = set()
 
@@ -230,8 +318,13 @@ def parse_xlsx_file(
     """
     Parse an XLSX file into NormalizedRecords.
 
-    Reads all sheets, treats first row as header, and converts each data row
-    into a NormalizedRecord with entity extraction and German format handling.
+    Reads all sheets, detects the real header row per sheet (see
+    `_detect_header_row` - GDPdU/GoBD exports routinely have a banner and a
+    blank row above the actual header), and converts each row below the
+    header into a NormalizedRecord with entity extraction and German format
+    handling. Sheets where no header is found (e.g. label/value
+    reconciliation sheets) fall back to positional `column_N` names and
+    treat every row as data.
 
     Args:
         file_path: Absolute path to the XLSX file.
@@ -268,17 +361,40 @@ def parse_xlsx_file(
                 )
                 continue
 
-            # First row is header
-            raw_headers = rows[0]
-            headers: list[str] = []
-            for i, h in enumerate(raw_headers):
-                if h is not None:
-                    headers.append(str(h).strip())
-                else:
-                    headers.append(f"column_{i}")
+            header_row_idx = _detect_header_row(rows)
+
+            if header_row_idx is not None:
+                raw_headers = rows[header_row_idx]
+                headers: list[str] = []
+                for i, h in enumerate(raw_headers):
+                    if h is not None:
+                        headers.append(str(h).strip())
+                    else:
+                        headers.append(f"column_{i}")
+                data_rows = enumerate(
+                    rows[header_row_idx + 1 :], start=header_row_idx + 2
+                )
+            else:
+                logger.info(
+                    "No header row detected in sheet '%s' of %s within the "
+                    "first %d rows; using positional column names and "
+                    "treating every row as data.",
+                    sheet_name,
+                    relative_path,
+                    _MAX_HEADER_SCAN_ROWS,
+                )
+                headers = [f"column_{i}" for i in range(len(rows[0]))]
+                data_rows = enumerate(rows, start=1)
+
+            # A synthetic header carries no real column names, so the
+            # first-column entity-id fallback in _extract_entities must not
+            # run - see that function's docstring.
+            row_entity_strategy = (
+                entity_strategy if header_row_idx is not None else None
+            )
 
             # Process data rows
-            for row_idx, row in enumerate(rows[1:], start=2):
+            for row_idx, row in data_rows:
                 # Skip completely empty rows
                 if all(cell is None or str(cell).strip() == "" for cell in row):
                     continue
@@ -295,7 +411,7 @@ def parse_xlsx_file(
 
                     # Extract entities
                     entities = _extract_entities(
-                        row_data, headers, entity_strategy
+                        row_data, headers, row_entity_strategy
                     )
 
                     # Extract amount and date
@@ -327,7 +443,7 @@ def parse_xlsx_file(
                         data=row_data,
                         date=date,
                         amount=amount,
-                        currency="EUR",
+                        currency="EUR" if amount is not None else None,
                     )
                     records.append(record)
 
