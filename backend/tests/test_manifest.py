@@ -129,12 +129,23 @@ def test_empty_file_excluded(sample_dir: Path):
     assert empty_entry.size_bytes == 0
 
 
-def test_non_empty_files_not_excluded(sample_dir: Path):
+def test_non_empty_evidence_and_supporting_files_not_excluded(sample_dir: Path):
     manifest = build_manifest(sample_dir, DOSSIER_ID)
     for entry in manifest.entries:
-        if entry.size_bytes > 0:
+        if entry.size_bytes > 0 and entry.classification != FileClassification.technical_metadata:
             assert entry.excluded_from_analysis is False
             assert entry.exclusion_reason is None
+
+
+def test_technical_metadata_excluded_with_reason(sample_dir: Path):
+    manifest = build_manifest(sample_dir, DOSSIER_ID)
+    by_path = {e.relative_path: e for e in manifest.entries}
+
+    for path in ("index.xml", "gdpdu-01-08-2002.dtd"):
+        entry = by_path[path]
+        assert entry.classification == FileClassification.technical_metadata
+        assert entry.excluded_from_analysis is True
+        assert entry.exclusion_reason is not None
 
 
 def test_mime_type_detection():

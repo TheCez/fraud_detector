@@ -1,10 +1,13 @@
 """
 XML parser for GDPdU/GoBD dossier files.
 
-For GDPdU index.xml files: returns an empty list (metadata consumed by the
-TXT parser for column definitions).
+GDPdU index.xml files are classified as technical_metadata by
+app.ingestion.manifest and never reach this parser - the orchestrator's
+_route_file skips them before dispatch. They are still read directly by
+app.normalization.parsers.gdpdu_txt.parse_gdpdu_folder for column definitions;
+this module only ever sees other, content-bearing XML files.
 
-For other XML files: extracts structural metadata as document_text records.
+Extracts structural metadata from those files as document_text records.
 """
 
 from __future__ import annotations
@@ -33,23 +36,6 @@ def _make_record_id(dossier_id: str, file_id: str, row: int, index: int) -> str:
     """Generate stable UUID5 for a record."""
     dossier_ns = uuid.uuid5(NAMESPACE_URL, f"dossier:{dossier_id}")
     return str(uuid.uuid5(dossier_ns, f"{file_id}:{row}:{index}"))
-
-
-def _is_gdpdu_index(file_path: Path, relative_path: str) -> bool:
-    """
-    Determine if this XML file is a GDPdU index.xml.
-
-    GDPdU index.xml files are metadata descriptors for the data tables
-    and are consumed by the TXT parser to determine column definitions.
-    They should not be parsed as content.
-    """
-    filename = file_path.name.lower()
-    if filename == "index.xml":
-        return True
-    # Also match gdpdu_index.xml or similar variants
-    if "index" in filename and filename.endswith(".xml"):
-        return True
-    return False
 
 
 def _strip_namespace(tag: str) -> str:
@@ -90,10 +76,7 @@ def parse_xml_file(
     file_id: str,
 ) -> list[NormalizedRecord]:
     """
-    Parse an XML file into NormalizedRecords.
-
-    For GDPdU index.xml files, returns an empty list (metadata only, consumed
-    by the TXT parser). For other XML files, extracts top-level elements as
+    Parse an XML file into NormalizedRecords, extracting top-level elements as
     document_text records.
 
     Args:
@@ -103,16 +86,8 @@ def parse_xml_file(
         file_id: Stable ID of this file in the manifest.
 
     Returns:
-        List of NormalizedRecords. Empty list for index.xml or on failure.
+        List of NormalizedRecords. Empty list on failure.
     """
-    # Skip GDPdU index.xml - it's metadata for the TXT parser
-    if _is_gdpdu_index(file_path, relative_path):
-        logger.debug(
-            "Skipping GDPdU index.xml: %s (metadata for TXT parser)",
-            relative_path,
-        )
-        return []
-
     # Safety check: file size
     try:
         file_size = file_path.stat().st_size

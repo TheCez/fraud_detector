@@ -46,32 +46,53 @@ _FILENAME_TO_RECORD_TYPE: dict[str, RecordType] = {
     "anlagenbuchungen": RecordType.asset_posting,
 }
 
-# Fields that contain entity references, keyed by canonical upper-case column name
-_ACCOUNT_FIELDS = {"SACHKONTONUMMER", "GEGENKONTO", "KONTO"}
+# Fields that contain entity references, keyed by canonical upper-case column name.
+# ANLAGENGRUPPE is the GL capitalization account for an asset (verified against
+# Sachkonten.txt - e.g. "040000" = "Maschinen und maschinelle Anlagen"), so it is an
+# account reference in the same sense as SACHKONTONUMMER/GEGENKONTO.
+_ACCOUNT_FIELDS = {"SACHKONTONUMMER", "GEGENKONTO", "KONTO", "ANLAGENGRUPPE"}
 _VENDOR_FIELDS = {"LIEFERANTENKONTONUMMER"}
 _CUSTOMER_FIELDS = {"KUNDENKONTONUMMER"}
 _USER_FIELDS = {"BENUTZERKENNUNG", "ERFASSER", "GEAENDERT_VON"}
+_ASSET_FIELDS = {"ANLAGENNUMMER"}
 
-# Date fields (values in DD.MM.YYYY format)
+# SACHKONTONUMMER values are sometimes composite: "<account>-<suffix>" where the
+# 6-digit suffix identifies the subledger party or asset behind a control account
+# (verified against Uebungsdaten_Muster_Verpackungen.zip's Sachkontobuchungen.txt).
+# The suffix's leading digit tells us which: customer IDs in this dataset are
+# 100000-199999 (Debitoren/Kunden.txt), vendor IDs are 200000-299999
+# (Kreditoren/Lieferanten.txt), and asset control accounts (e.g. "040000-000191")
+# reuse the asset's own AV/Anlagen.txt ANLAGENNUMMER as the suffix instead of a
+# separate party. Not every hyphenated value is composite - GEGENKONTO and KONTO
+# never carry this pattern in the sample data, so decomposition only applies to
+# SACHKONTONUMMER.
+_COMPOSITE_ACCOUNT_RE = re.compile(r"^(\d+)-(\d{6})$")
+
+# Date fields (values in DD.MM.YYYY format). ANSCHAFFUNGSDATUM/ABGANGSDATUM do not
+# appear in any real GDPdU export column in this dataset's index.xml files - verified
+# directly against the sample ZIP - and are replaced by WERTSTELLUNG, which is the
+# actual date column on AV/Anlagenbuchungen.txt (asset postings).
 _DATE_FIELDS = {
     "BUCHUNGSDATUM",
     "BELEGDATUM",
     "ERFASSUNGSDATUM",
     "LETZTER_AUSGLEICH",
-    "ANSCHAFFUNGSDATUM",
-    "ABGANGSDATUM",
+    "WERTSTELLUNG",
 }
 
 # Primary date field used for the top-level `date` attribute
 _PRIMARY_DATE_FIELD = "BUCHUNGSDATUM"
 
-# Numeric fields (German decimal format)
+# Fallback date fields tried in order when the primary field is absent (e.g. AV
+# asset postings, which have no BUCHUNGSDATUM/BELEGDATUM column at all).
+_FALLBACK_DATE_FIELDS = ("BELEGDATUM", "WERTSTELLUNG")
+
+# Numeric fields (German decimal format). ANSCHAFFUNGSWERT/BUCHWERT/
+# ABSCHREIBUNGSBETRAG do not appear in any real GDPdU export column in this
+# dataset - verified directly against the sample ZIP.
 _NUMERIC_FIELDS = {
     "BUCHUNGSBETRAG",
     "BUCHUNGSWERT",
-    "ANSCHAFFUNGSWERT",
-    "BUCHWERT",
-    "ABSCHREIBUNGSBETRAG",
 }
 
 # Primary amount field
@@ -87,6 +108,19 @@ _GERMAN_DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 # ---------------------------------------------------------------------------
 # index.xml parsing
 # ---------------------------------------------------------------------------
+
+
+def _find_index_xml(folder_path: Path) -> Path | None:
+    """Locate index.xml in a GDPdU folder, matching the filename case-insensitively.
+
+    Windows filesystems resolve `folder_path / "index.xml"` regardless of case, but
+    a real archive extracted on Linux (or one produced with `INDEX.XML`) would raise
+    FileNotFoundError on an exact-case lookup. Returns None if no match is found.
+    """
+    for child in folder_path.iterdir():
+        if child.is_file() and child.name.lower() == "index.xml":
+            return child
+    return None
 
 
 def parse_index_xml(index_path: Path) -> dict[str, list[str]]:
@@ -208,6 +242,34 @@ def convert_german_date(value: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _decompose_sachkontonummer(value: str) -> list[tuple[str, str]]:
+    """Split a composite SACHKONTONUMMER into its GL account and, where the suffix
+    identifies a real subledger party, a second entity.
+
+    Returns a list of (entity_type, entity_id) pairs. A non-composite value yields
+    a single ("account", value) pair unchanged.
+    """
+    match = _COMPOSITE_ACCOUNT_RE.match(value)
+    if not match:
+        return [("account", value)]
+
+    account_id, suffix = match.groups()
+    if suffix.startswith("1"):
+        return [("account", account_id), ("customer", suffix)]
+    if suffix.startswith("2"):
+        return [("account", account_id), ("vendor", suffix)]
+    if suffix.startswith("0"):
+        # Asset control accounts encode the asset's own AV/Anlagen.txt ANLAGENNUMMER
+        # as the suffix, not a subledger party - keep the full composite value as
+        # the asset ID so these postings join the same asset node as AV records,
+        # and do not fabricate a vendor/customer that isn't there.
+        return [("account", account_id), ("asset", value)]
+
+    # Unrecognized suffix shape - keep the whole value as a single account entity
+    # rather than guessing at a party type that hasn't been verified in real data.
+    return [("account", value)]
+
+
 def _extract_entities(
     row_data: dict[str, Any],
     columns: list[str],
@@ -216,10 +278,22 @@ def _extract_entities(
     entities: list[EntityRef] = []
     seen: set[tuple[str, str]] = set()
 
+    def _add(entity_type: str, entity_id: str) -> None:
+        key = (entity_type, entity_id)
+        if key not in seen:
+            seen.add(key)
+            entities.append(EntityRef(entity_type=entity_type, entity_id=entity_id, label=None))
+
     for col in columns:
         col_upper = col.upper()
         value = row_data.get(col)
         if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        str_value = str(value).strip()
+
+        if col_upper == "SACHKONTONUMMER":
+            for entity_type, entity_id in _decompose_sachkontonummer(str_value):
+                _add(entity_type, entity_id)
             continue
 
         entity_type: str | None = None
@@ -231,19 +305,11 @@ def _extract_entities(
             entity_type = "customer"
         elif col_upper in _USER_FIELDS:
             entity_type = "user"
+        elif col_upper in _ASSET_FIELDS:
+            entity_type = "asset"
 
         if entity_type is not None:
-            str_value = str(value).strip()
-            key = (entity_type, str_value)
-            if key not in seen:
-                seen.add(key)
-                entities.append(
-                    EntityRef(
-                        entity_type=entity_type,
-                        entity_id=str_value,
-                        label=None,
-                    )
-                )
+            _add(entity_type, str_value)
 
     return entities
 
@@ -298,6 +364,16 @@ def _extract_relationships(
                     if val:
                         relationships["paid_to"] = val
                         break
+
+    # capitalized_to: GL account an asset posting is capitalized against
+    if filename_stem == "anlagenbuchungen" and "ANLAGENGRUPPE" in col_upper_set:
+        actual_col = next(
+            (c for c in columns if c.upper() == "ANLAGENGRUPPE"), None
+        )
+        if actual_col and row_data.get(actual_col):
+            val = str(row_data[actual_col]).strip()
+            if val:
+                relationships["capitalized_to"] = val
 
     return relationships
 
@@ -391,7 +467,7 @@ def _parse_txt_file(
 
             # Extract primary fields
             primary_date: str | None = None
-            for date_field in (_PRIMARY_DATE_FIELD, "BELEGDATUM"):
+            for date_field in (_PRIMARY_DATE_FIELD, *_FALLBACK_DATE_FIELDS):
                 actual_col = next(
                     (c for c in columns if c.upper() == date_field), None
                 )
@@ -502,8 +578,8 @@ def parse_gdpdu_folder(
         FileNotFoundError: If index.xml is missing from the folder.
         ValueError: If index.xml cannot be parsed or contains no table definitions.
     """
-    index_path = folder_path / "index.xml"
-    if not index_path.exists():
+    index_path = _find_index_xml(folder_path)
+    if index_path is None:
         raise FileNotFoundError(
             f"index.xml not found in GDPdU folder: {folder_path}"
         )
