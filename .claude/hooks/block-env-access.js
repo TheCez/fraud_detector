@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // PreToolUse guard: deny shell commands that touch the real environment file.
 //
-// That file holds live Cognee and OpenAI credentials. It is gitignored and no
-// agent may read it or pipe it anywhere. `.env.example` is the documented,
+// That file holds live OpenAI credentials. It is gitignored and no agent may
+// read it or pipe it anywhere. `.env.example` is the documented,
 // secret-free template and stays readable.
 //
 // Default-deny: if the secret filename appears anywhere in the command, block.

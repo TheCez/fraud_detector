@@ -47,12 +47,13 @@ The `cognee` branch is a preservation snapshot of the Cognee-based implementatio
 
 ### T2 - Graph-traversing analyzer, and Cognee deleted
 
-- **Status:** todo
-- **Owner:** unassigned
+- **Status:** in review
+- **Owner:** subagent `graph-analyzer`
 - **Depends on:** T1
 - **Goal:** `analysis/graph_analyzer.py` walks one process graph at a time using the T1 tool API, with a red-flag briefing and a hard step budget. Move `EvidenceRecordStore` into the empty `app/evidence/` package - it is Cognee-independent and is the correctness guarantee. Then remove `CogneeCloudGraph`, the cloud payload filter, the `graph_ingestions` flow, and the Cognee settings.
 - **Files:** `backend/app/analysis/`, `backend/app/evidence/`, `backend/app/core/settings.py`, `.env.example`, `backend/tests/test_cloud_graph.py`
 - **Acceptance:** the model still cannot express evidence text - it cites `record_ids` only, and a proposal is discarded whole if any ID fails to resolve. `GraphUnavailableError` and the `analysis_incomplete` degraded path keep working, now meaning the model or the graph build failed. Cost is bounded per subgraph.
+- **What landed:** `app/analysis/prefilter.py` adds a cheap, deterministic, recall-oriented pre-filter (vendor-with-no-receipt, self-approved master-data changes, repair-worded assets, round amounts, near-round-threshold payment clusters, booking/service period mismatches) that narrows the sample dossier's 4,902 process graphs down substantially before any model call - see the PR body for the exact count. `app/analysis/graph_analyzer.py`'s `GraphAnalyzer` walks each selected graph with a bounded LangGraph agent (hard step budget, enforced by the traversal graph's routing) over the T1 tool API, plus a hard per-run model-call cap (`AgentSettings.model_call_cap`) that is logged and recorded - never silently swallowed - when hit. `EvidenceRecordStore` moved to `app/evidence/store.py` unchanged in behavior. `runner.py` now builds and persists the local graph whenever normalization produces records, regardless of analyzer mode. All Cognee code, settings, and the `graph_ingestions` table/flow are deleted; see the PR's grep output.
 
 ### T3 - Graph API seams for chat and UI
 

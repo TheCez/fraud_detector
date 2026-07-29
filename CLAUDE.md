@@ -6,7 +6,7 @@ Reusable project workflows live in `.codex/skills/`. Use the skill relevant to t
 
 ## Secrets
 
-- Never read, open, copy, print, or pass along `.env`. It holds live Cognee and OpenAI credentials.
+- Never read, open, copy, print, or pass along `.env`. It holds live OpenAI credentials.
 - `.env.example` is the secret-free template. Read it when you need variable names.
 - Only the backend reads the real values, at runtime, through `backend/app/core/settings.py`.
 - `.env` stays gitignored and is never committed. A `PreToolUse` hook in `.claude/settings.json` blocks shell access to it, and `permissions.deny` blocks reading it - do not work around either.

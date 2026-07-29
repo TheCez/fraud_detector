@@ -1,7 +1,7 @@
 """Deterministic, in-memory graph construction for one dossier.
 
-No LLM, no network calls, no Cognee - pure graph construction from
-already-normalized records in the ``normalized_records`` SQLite table.
+No LLM, no network calls - pure graph construction from already-normalized
+records in the ``normalized_records`` SQLite table.
 
 Two edge families:
 

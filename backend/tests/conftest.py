@@ -2,10 +2,9 @@ import pytest
 
 _AGENT_ENV_VARS = (
     "FRAUD_AGENT_ENABLED",
-    "COGNEE_API_KEY",
-    "COGNEE_SERVICE_URL",
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
+    "FRAUD_AGENT_MODEL_CALL_CAP",
 )
 
 

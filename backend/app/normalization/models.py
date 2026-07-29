@@ -1,15 +1,15 @@
 """
-Cognee-compatible normalized record models.
+Normalized record models - the universal intermediate format.
 
 These models define the universal intermediate format between raw GDPdU/GoBD
-data and the Cognee knowledge graph. Each NormalizedRecord becomes a graph node;
-EntityRef entries become labeled edges connecting nodes.
+data and the local knowledge graph (`app/graph/`). Each NormalizedRecord becomes
+a graph node; EntityRef entries become labeled edges connecting nodes.
 
 Design principles:
 - Self-contained JSON objects with clear entity types
 - Relationships expressed as labeled fields (posted_by, paid_to, approved_by)
 - Stable IDs and full source provenance for auditability
-- Exportable as JSONL for direct Cognee ingestion via cognee.add()
+- Exportable as JSONL, one record per line, for streaming graph construction
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 
 class RecordType(str, Enum):
-    """Types of normalized records - maps to Cognee node types."""
+    """Types of normalized records - maps to a record-node type in the local graph."""
 
     journal_entry = "journal_entry"  # GL postings (Sachkontobuchungen)
     vendor_posting = "vendor_posting"  # Kreditoren postings
@@ -40,7 +40,7 @@ class RecordType(str, Enum):
 
 class EntityRef(BaseModel):
     """
-    A typed reference to a domain entity - becomes a graph edge in Cognee.
+    A typed reference to a domain entity - becomes a graph edge in the local graph.
 
     The entity_type+entity_id pair identifies a unique node in the graph.
     Multiple records referencing the same pair will share a single node,
@@ -99,15 +99,15 @@ class SourceProvenance(BaseModel):
 
 class NormalizedRecord(BaseModel):
     """
-    A single normalized record - the universal unit for Cognee ingestion.
+    A single normalized record - the universal unit for local graph construction.
 
-    Each record maps to a node in the knowledge graph.
+    Each record maps to a node in the local graph (`app/graph/builder.py`).
     Entity references (entities field) become edges to shared entity nodes.
     The relationships dict provides human-readable labeled edges.
     The data dict holds the actual parsed values from the source.
 
-    Cognee ingestion flow:
-        NormalizedRecord -> JSONL line -> cognee.add() -> graph node + edges
+    Graph construction flow:
+        NormalizedRecord -> JSONL line -> SQLite -> app.graph.builder.build_graph
     """
 
     record_id: str = Field(
@@ -115,13 +115,13 @@ class NormalizedRecord(BaseModel):
     )
     dossier_id: str = Field(description="ID of the parent dossier/upload")
     record_type: RecordType = Field(
-        description="Semantic type - determines which Cognee node type is created"
+        description="Semantic type - determines which graph node type is created"
     )
     source: SourceProvenance = Field(
         description="Exact location in the original evidence"
     )
 
-    # Cognee graph fields
+    # Local graph fields
     entities: list[EntityRef] = Field(
         default_factory=list,
         description="All entity references - each becomes a graph edge to a shared node",
@@ -170,7 +170,7 @@ class NormalizedOutput(BaseModel):
     Output from a single file's normalization.
 
     Represents all records extracted from one source file. Written as JSONL
-    where each line is one NormalizedRecord for streaming Cognee ingestion.
+    where each line is one NormalizedRecord, for streaming graph construction.
     """
 
     file_id: str = Field(description="ID of the source file that was normalized")
@@ -187,7 +187,7 @@ class NormalizedOutput(BaseModel):
     )
 
     def to_jsonl(self) -> str:
-        """Serialize records as JSONL for Cognee ingestion."""
+        """Serialize records as JSONL, one record per line."""
         lines: list[str] = []
         for record in self.records:
             lines.append(record.model_dump_json())

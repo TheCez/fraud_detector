@@ -272,7 +272,7 @@ def init_findings_table(db_path: Path) -> None:
         con.close()
 
 
-# --- Analysis runs and graph ingestion ---
+# --- Analysis runs ---
 
 _CREATE_ANALYSIS_RUNS_TABLE = """
 CREATE TABLE IF NOT EXISTS analysis_runs (
@@ -288,59 +288,14 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
 )
 """
 
-_CREATE_GRAPH_INGESTIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS graph_ingestions (
-    dossier_id TEXT PRIMARY KEY,
-    dataset_name TEXT NOT NULL,
-    normalized_sha256 TEXT NOT NULL,
-    status TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    error TEXT,
-    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
-)
-"""
-
 
 def init_analysis_tables(db_path: Path) -> None:
     con = sqlite3.connect(db_path)
     try:
         con.execute(_CREATE_ANALYSIS_RUNS_TABLE)
-        con.execute(_CREATE_GRAPH_INGESTIONS_TABLE)
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_analysis_runs_dossier "
             "ON analysis_runs(dossier_id, created_at DESC)"
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def get_graph_ingestion(db_path: Path, dossier_id: str) -> dict | None:
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    try:
-        row = con.execute(
-            "SELECT * FROM graph_ingestions WHERE dossier_id = ?", (dossier_id,)
-        ).fetchone()
-        return dict(row) if row is not None else None
-    finally:
-        con.close()
-
-
-def save_graph_ingestion(
-    db_path: Path, dossier_id: str, dataset_name: str, normalized_sha256: str, status: str, error: str | None = None
-) -> None:
-    from datetime import datetime, timezone
-
-    con = sqlite3.connect(db_path)
-    try:
-        con.execute(
-            "INSERT INTO graph_ingestions (dossier_id, dataset_name, normalized_sha256, status, updated_at, error) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(dossier_id) DO UPDATE SET dataset_name = excluded.dataset_name, "
-            "normalized_sha256 = excluded.normalized_sha256, status = excluded.status, "
-            "updated_at = excluded.updated_at, error = excluded.error",
-            (dossier_id, dataset_name, normalized_sha256, status, datetime.now(timezone.utc).isoformat(), error),
         )
         con.commit()
     finally:
