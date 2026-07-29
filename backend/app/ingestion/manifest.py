@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from app.models.schemas import FileClassification, ParseStatus
 
 
-ACCOUNTING_FOLDERS = {"sachkonten", "kreditoren", "debitoren", "av"}
+ACCOUNTING_FOLDERS = {"sachkonten", "kreditoren", "debitoren", "av", "steuercodes"}
 
 MIME_MAP: dict[str, str] = {
     ".txt": "text/plain",
@@ -36,6 +36,7 @@ class ManifestEntry(BaseModel):
     normalized_record_count: int = 0
     excluded_from_analysis: bool = False
     exclusion_reason: str | None = None
+    parse_error: str | None = None
 
 
 class Manifest(BaseModel):
@@ -68,15 +69,25 @@ def _classify_file(relative_path: str, extension: str, size_bytes: int) -> tuple
     parent_folders = {p.lower() for p in parts[:-1]}
     filename = Path(relative_path).name.lower()
 
+    # Technical metadata (index.xml, the GDPdU DTD) is a schema input, not analyzable
+    # evidence: it is always excluded from analysis, independent of file size. Per
+    # agents/PROJECT_SPEC.md, it is never deleted - only kept out of normalization and
+    # the graph. The file stays on disk and index.xml is still read directly by
+    # gdpdu_txt.parse_gdpdu_folder for column definitions; "excluded from analysis"
+    # means "never emitted as normalized records", not "unreadable".
+    if filename == "index.xml" or extension == ".dtd":
+        return (
+            FileClassification.technical_metadata,
+            True,
+            "technical metadata (GDPdU schema definition) - retained for reproducibility, excluded from analysis",
+        )
+
     excluded = False
     exclusion_reason: str | None = None
 
     if size_bytes == 0:
         excluded = True
         exclusion_reason = "empty file"
-
-    if filename == "index.xml" or extension == ".dtd":
-        return FileClassification.technical_metadata, excluded, exclusion_reason
 
     if extension in (".txt", ".csv") and parent_folders & ACCOUNTING_FOLDERS:
         return FileClassification.evidence, excluded, exclusion_reason

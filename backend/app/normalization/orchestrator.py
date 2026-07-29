@@ -9,15 +9,16 @@ import json
 import logging
 from pathlib import Path
 
-from app.ingestion.manifest import Manifest, ManifestEntry, save_manifest
-from app.models.schemas import ParseStatus
+from app.ingestion.manifest import ACCOUNTING_FOLDERS, Manifest, ManifestEntry, save_manifest
+from app.models.schemas import FileClassification, ParseStatus
 from app.normalization.models import NormalizedOutput, NormalizedRecord
 from app.persistence.database import bulk_insert_records, init_normalized_table
 
 logger = logging.getLogger(__name__)
 
-# GDPdU accounting folders that require folder-level parsing (index.xml driven)
-_GDPDU_FOLDERS = {"sachkonten", "kreditoren", "debitoren", "av"}
+# GDPdU accounting folders that require folder-level parsing (index.xml driven).
+# Shared with app.ingestion.manifest so classification and routing never drift apart.
+_GDPDU_FOLDERS = ACCOUNTING_FOLDERS
 
 # Parser module names mapped to extensions
 _EXTENSION_PARSERS: dict[str, str] = {
@@ -27,9 +28,6 @@ _EXTENSION_PARSERS: dict[str, str] = {
     ".pdf": "pdf_parser",
     ".xml": "xml_parser",
 }
-
-# Extensions to skip entirely
-_SKIP_EXTENSIONS = {".dtd"}
 
 
 def normalize_dossier(
@@ -77,9 +75,21 @@ def normalize_dossier(
                 and e.extension == ".txt"
             ]
 
-            records = _parse_gdpdu_folder(
-                folder_key, folder_entries, extracted_dir, dossier_id
-            )
+            try:
+                records = _parse_gdpdu_folder(
+                    folder_key, folder_entries, extracted_dir, dossier_id
+                )
+            except Exception as exc:
+                # A missing/unreadable index.xml (or any other folder-level failure)
+                # must be loud, not look like a successfully parsed empty table -
+                # otherwise the graph would silently lose an entire accounting folder.
+                logger.exception("Failed to parse GDPdU folder: %s", folder_key)
+                for fe in folder_entries:
+                    fe.parse_status = ParseStatus.error
+                    fe.parser = "gdpdu_txt"
+                    fe.normalized_record_count = 0
+                    fe.parse_error = str(exc)
+                continue
 
             # Distribute records back to individual file entries
             records_by_file: dict[str, list[NormalizedRecord]] = {}
@@ -156,13 +166,19 @@ def _write_jsonl(records: list[NormalizedRecord], output_path: Path) -> None:
 
 
 def _route_file(entry: ManifestEntry, extracted_dir: Path) -> str | None:
-    """Return parser name for a manifest entry, or None to skip."""
-    # Skip excluded files
-    if entry.excluded_from_analysis:
+    """Return parser name for a manifest entry, or None to skip.
+
+    Technical metadata (index.xml, the GDPdU DTD) is never routed to a parser -
+    `classification == technical_metadata` is the single decision point for that.
+    It stays on disk and index.xml is still read directly by
+    gdpdu_txt.parse_gdpdu_folder for column definitions; it is just never emitted
+    as normalized records.
+    """
+    if entry.classification == FileClassification.technical_metadata:
         return None
 
-    # Skip technical metadata like .dtd files
-    if entry.extension in _SKIP_EXTENSIONS:
+    # Skip other excluded files (e.g. zero-byte files)
+    if entry.excluded_from_analysis:
         return None
 
     # GDPdU txt files in accounting folders
@@ -199,34 +215,32 @@ def _parse_gdpdu_folder(
     """
     Parse an entire GDPdU folder using the gdpdu_txt parser.
     Returns all records from the folder.
+
+    Raises on any failure (folder missing from the extraction, missing/unreadable
+    index.xml, or any other parse error). The caller marks every entry in the
+    folder ParseStatus.error rather than swallowing the failure - a folder that
+    silently yields zero records would be indistinguishable from one that
+    genuinely has no data.
     """
-    try:
-        from app.normalization.parsers.gdpdu_txt import parse_gdpdu_folder
+    from app.normalization.parsers.gdpdu_txt import parse_gdpdu_folder
 
-        # Find the actual folder path within extracted_dir
-        # The folder_key is lowercased; find the real path by case-insensitive match
-        folder_path: Path | None = None
-        for child in extracted_dir.rglob("*"):
-            if child.is_dir() and child.name.lower() == folder_key:
-                folder_path = child
-                break
+    # Find the actual folder path within extracted_dir
+    # The folder_key is lowercased; find the real path by case-insensitive match
+    folder_path: Path | None = None
+    for child in extracted_dir.rglob("*"):
+        if child.is_dir() and child.name.lower() == folder_key:
+            folder_path = child
+            break
 
-        if folder_path is None:
-            logger.warning("GDPdU folder not found in extracted dir: %s", folder_key)
-            return []
+    if folder_path is None:
+        raise FileNotFoundError(f"GDPdU folder not found in extracted dir: {folder_key}")
 
-        # Build file_id_map: relative_path -> file_id
-        file_id_map: dict[str, str] = {}
-        for entry in entries:
-            file_id_map[entry.relative_path] = entry.file_id
+    # Build file_id_map: relative_path -> file_id
+    file_id_map: dict[str, str] = {
+        entry.relative_path: entry.file_id for entry in entries
+    }
 
-        return parse_gdpdu_folder(folder_path, dossier_id, file_id_map)
-    except ImportError:
-        logger.warning("gdpdu_txt parser not yet implemented, skipping folder: %s", folder_key)
-        return []
-    except Exception:
-        logger.exception("Error parsing GDPdU folder: %s", folder_key)
-        return []
+    return parse_gdpdu_folder(folder_path, dossier_id, file_id_map)
 
 
 def _parse_single_file(
