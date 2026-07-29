@@ -213,6 +213,27 @@ def get_record_by_id(db_path: Path, dossier_id: str, record_id: str) -> dict | N
         con.close()
 
 
+def iter_records_by_dossier(db_path: Path, dossier_id: str):
+    """Yield every normalized record for a dossier, one row at a time.
+
+    Unlike ``get_records_by_type``/``get_records_by_file`` this is not paged by
+    the caller - it streams the whole dossier via a single open cursor so a ~30k
+    row dossier never has to be materialized into one Python list just to be
+    read once (e.g. for graph construction).
+    """
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        cursor = con.execute(
+            "SELECT * FROM normalized_records WHERE dossier_id = ? ORDER BY record_id",
+            (dossier_id,),
+        )
+        for row in cursor:
+            yield dict(row)
+    finally:
+        con.close()
+
+
 # --- Findings ---
 
 _CREATE_FINDINGS_TABLE = """
@@ -397,5 +418,192 @@ def get_finding(db_path: Path, dossier_id: str, finding_id: str) -> dict | None:
         if row is None:
             return None
         return json.loads(row["data_json"])
+    finally:
+        con.close()
+
+
+# --- Local graph engine ---
+
+_CREATE_GRAPH_NODES_TABLE = """
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    dossier_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    PRIMARY KEY (dossier_id, node_id),
+    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
+)
+"""
+
+_CREATE_GRAPH_EDGES_TABLE = """
+CREATE TABLE IF NOT EXISTS graph_edges (
+    dossier_id TEXT NOT NULL,
+    edge_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    target TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    record_ids_json TEXT NOT NULL,
+    PRIMARY KEY (dossier_id, edge_id),
+    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
+)
+"""
+
+_CREATE_PROCESS_GRAPHS_TABLE = """
+CREATE TABLE IF NOT EXISTS process_graphs (
+    dossier_id TEXT NOT NULL,
+    graph_id TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    record_count INTEGER NOT NULL,
+    PRIMARY KEY (dossier_id, graph_id),
+    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
+)
+"""
+
+_CREATE_GRAPH_NODES_IDX = """
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_dossier ON graph_nodes(dossier_id)
+"""
+
+_CREATE_GRAPH_EDGES_IDX_DOSSIER = """
+CREATE INDEX IF NOT EXISTS idx_graph_edges_dossier ON graph_edges(dossier_id)
+"""
+
+_CREATE_GRAPH_EDGES_IDX_SOURCE = """
+CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(dossier_id, source)
+"""
+
+_CREATE_GRAPH_EDGES_IDX_TARGET = """
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(dossier_id, target)
+"""
+
+_CREATE_PROCESS_GRAPHS_IDX = """
+CREATE INDEX IF NOT EXISTS idx_process_graphs_dossier ON process_graphs(dossier_id)
+"""
+
+
+def init_graph_tables(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_CREATE_GRAPH_NODES_TABLE)
+        con.execute(_CREATE_GRAPH_EDGES_TABLE)
+        con.execute(_CREATE_PROCESS_GRAPHS_TABLE)
+        con.execute(_CREATE_GRAPH_NODES_IDX)
+        con.execute(_CREATE_GRAPH_EDGES_IDX_DOSSIER)
+        con.execute(_CREATE_GRAPH_EDGES_IDX_SOURCE)
+        con.execute(_CREATE_GRAPH_EDGES_IDX_TARGET)
+        con.execute(_CREATE_PROCESS_GRAPHS_IDX)
+        con.commit()
+    finally:
+        con.close()
+
+
+def bulk_insert_graph_nodes(db_path: Path, dossier_id: str, nodes: list[dict]) -> int:
+    """Insert graph nodes in batches. Each dict needs node_id, node_type, data_json."""
+    if not nodes:
+        return 0
+
+    con = sqlite3.connect(db_path)
+    inserted = 0
+    try:
+        for i in range(0, len(nodes), _BATCH_SIZE):
+            batch = [
+                {"dossier_id": dossier_id, **node} for node in nodes[i : i + _BATCH_SIZE]
+            ]
+            con.executemany(
+                "INSERT OR REPLACE INTO graph_nodes (dossier_id, node_id, node_type, data_json) "
+                "VALUES (:dossier_id, :node_id, :node_type, :data_json)",
+                batch,
+            )
+            inserted += len(batch)
+        con.commit()
+    finally:
+        con.close()
+    return inserted
+
+
+def bulk_insert_graph_edges(db_path: Path, dossier_id: str, edges: list[dict]) -> int:
+    """Insert graph edges in batches. Each dict needs edge_id, source, target,
+    edge_type, record_ids_json."""
+    if not edges:
+        return 0
+
+    con = sqlite3.connect(db_path)
+    inserted = 0
+    try:
+        for i in range(0, len(edges), _BATCH_SIZE):
+            batch = [
+                {"dossier_id": dossier_id, **edge} for edge in edges[i : i + _BATCH_SIZE]
+            ]
+            con.executemany(
+                "INSERT OR REPLACE INTO graph_edges "
+                "(dossier_id, edge_id, source, target, edge_type, record_ids_json) "
+                "VALUES (:dossier_id, :edge_id, :source, :target, :edge_type, :record_ids_json)",
+                batch,
+            )
+            inserted += len(batch)
+        con.commit()
+    finally:
+        con.close()
+    return inserted
+
+
+def bulk_insert_process_graphs(db_path: Path, dossier_id: str, process_graphs: list[dict]) -> int:
+    """Insert process-graph summaries. Each dict needs graph_id, data_json, record_count."""
+    if not process_graphs:
+        return 0
+
+    con = sqlite3.connect(db_path)
+    inserted = 0
+    try:
+        for i in range(0, len(process_graphs), _BATCH_SIZE):
+            batch = [
+                {"dossier_id": dossier_id, **pg} for pg in process_graphs[i : i + _BATCH_SIZE]
+            ]
+            con.executemany(
+                "INSERT OR REPLACE INTO process_graphs "
+                "(dossier_id, graph_id, data_json, record_count) "
+                "VALUES (:dossier_id, :graph_id, :data_json, :record_count)",
+                batch,
+            )
+            inserted += len(batch)
+        con.commit()
+    finally:
+        con.close()
+    return inserted
+
+
+def get_graph_nodes(db_path: Path, dossier_id: str) -> list[dict]:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT * FROM graph_nodes WHERE dossier_id = ?", (dossier_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def get_graph_edges(db_path: Path, dossier_id: str) -> list[dict]:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT * FROM graph_edges WHERE dossier_id = ?", (dossier_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def get_process_graphs(db_path: Path, dossier_id: str) -> list[dict]:
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT * FROM process_graphs WHERE dossier_id = ? ORDER BY graph_id",
+            (dossier_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         con.close()
