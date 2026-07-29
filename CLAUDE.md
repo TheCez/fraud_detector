@@ -12,6 +12,34 @@ Reusable project workflows live in `.codex/skills/`. Use the skill relevant to t
 - `.env` stays gitignored and is never committed. A `PreToolUse` hook in `.claude/settings.json` blocks shell access to it, and `permissions.deny` blocks reading it - do not work around either.
 - Do not echo secret values into logs, test fixtures, commit messages, or task descriptions.
 
+## Branching - one worktree and one PR per task
+
+Never commit or push directly to `main`. Every task or slice gets its own git worktree and its own pull request. No exceptions for "small" or "docs-only" changes.
+
+Worktrees live outside the repo, in a sibling directory, so dependency installs and build output never collide between tasks:
+
+```bash
+git worktree add -b <type>/<slice-name> ../fd-worktrees/<slice-name> main
+```
+
+Use `feat/`, `fix/`, `chore/`, `test/`, or `docs/` for `<type>`, and name the branch after the `agents/PLAN.md` task it implements.
+
+Then, from inside that worktree:
+
+```bash
+git push -u origin <type>/<slice-name>
+gh pr create --fill --base main
+```
+
+Rules:
+
+- One task, one worktree, one branch, one PR. A subagent works only inside its own worktree and never touches another's.
+- Branch from current `main`, not from another task's branch, unless the task genuinely depends on unmerged work - say so in the PR body when it does.
+- Each worktree needs its own dependency install (`.venv`, `node_modules`) before backend or frontend tests will run.
+- The orchestrator reviews the PR and runs the full suite. Only the human merges.
+- Remove the worktree once the PR is merged: `git worktree remove ../fd-worktrees/<slice-name>` then `git branch -d <type>/<slice-name>`.
+- `cognee` is a preservation snapshot of the Cognee-based implementation. Do not build on it or merge it into `main`.
+
 ## Agent roles
 
 The main session is the orchestrator. It plans, reviews, and integrates - it does not do the bulk coding itself.
