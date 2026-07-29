@@ -35,7 +35,7 @@ Rules:
 
 - One task, one worktree, one branch, one PR. A subagent works only inside its own worktree and never touches another's.
 - Branch from current `main`, not from another task's branch, unless the task genuinely depends on unmerged work - say so in the PR body when it does.
-- Each worktree needs its own dependency install (`.venv`, `node_modules`) before backend or frontend tests will run.
+- Each worktree needs its own frontend dependency install (`node_modules`) before frontend tests will run. Backend Python dependencies are installed in the machine's global Python 3.12.7 and are importable from any worktree - there is no per-worktree `backend/.venv`.
 - The orchestrator reviews the PR and runs the full suite. Only the human merges.
 - Remove the worktree once the PR is merged: `git worktree remove ../fd-worktrees/<slice-name>` then `git branch -d <type>/<slice-name>`.
 - `cognee` is a preservation snapshot of the Cognee-based implementation. Do not build on it or merge it into `main`.
