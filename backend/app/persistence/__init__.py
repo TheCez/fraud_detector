@@ -19,6 +19,14 @@ from app.persistence.database import (
     init_analysis_tables,
     get_graph_ingestion,
     save_graph_ingestion,
+    iter_records_by_dossier,
+    init_graph_tables,
+    bulk_insert_graph_nodes,
+    bulk_insert_graph_edges,
+    bulk_insert_process_graphs,
+    get_graph_nodes,
+    get_graph_edges,
+    get_process_graphs,
 )
 
 __all__ = [
@@ -42,4 +50,12 @@ __all__ = [
     "init_analysis_tables",
     "get_graph_ingestion",
     "save_graph_ingestion",
+    "iter_records_by_dossier",
+    "init_graph_tables",
+    "bulk_insert_graph_nodes",
+    "bulk_insert_graph_edges",
+    "bulk_insert_process_graphs",
+    "get_graph_nodes",
+    "get_graph_edges",
+    "get_process_graphs",
 ]
