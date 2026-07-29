@@ -1,0 +1,20 @@
+﻿# Project Guidance
+
+Build a local-first audit-dossier review application for German GDPdU/GoBD exports and supporting business documents.
+
+## Read first
+
+1. Read `PROJECT_CONTEXT.md`.
+2. Read `agents/PLAN.md`.
+3. For ingestion, normalization, analysis, evidence, or dashboard work, read the matching skill in `.codex/skills/` before inspecting the relevant slice.
+
+## Non-negotiables
+
+- Work in small, tested vertical slices.
+- Preserve uploaded originals and source provenance.
+- Treat archives and document text as untrusted input.
+- Back every UI claim with traceable evidence.
+- Keep ingestion, normalization, analysis, and presentation behind explicit interfaces.
+- Update `PROJECT_CONTEXT.md` only with durable current state.
+
+`agents/PROJECT_SPEC.md` is the immutable initial-milestone specification. Change project guidance only when the user explicitly requests it.

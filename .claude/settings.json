@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.local)",
+      "Read(./backend/.env)",
+      "Read(./frontend/.env)"
+    ]
+  },
+  "sandbox": {
+    "credentials": {
+      "files": [
+        { "path": ".env", "mode": "deny" },
+        { "path": ".env.local", "mode": "deny" }
+      ]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/block-env-access.js\"",
+            "shell": "bash",
+            "timeout": 10,
+            "statusMessage": "Checking .env guard"
+          }
+        ]
+      }
+    ]
+  }
+}
