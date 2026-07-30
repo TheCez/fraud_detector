@@ -8,28 +8,15 @@ file is never read. Follows the fixture style of test_graph_engine.py.
 
 from __future__ import annotations
 
-import zipfile
 from pathlib import Path
 
 import pytest
 
-from app.graph.builder import build_graph
 from app.graph.schema import entity_node_id
-from app.graph.store import save_graph
-from app.graph.subgraphs import build_process_graphs
 from app.analysis.prefilter import select_candidate_graphs
-from app.ingestion.manifest import build_manifest
-from app.normalization.orchestrator import normalize_dossier
+from tests.conftest import SAMPLE_DOSSIER_ID, requires_sample_zip
 
-SAMPLE_ZIP = (
-    Path(__file__).resolve().parent.parent.parent
-    / "sample_data"
-    / "Uebungsdaten_Muster_Verpackungen.zip"
-)
-
-requires_sample_zip = pytest.mark.skipif(not SAMPLE_ZIP.exists(), reason="sample ZIP not available")
-
-DOSSIER_ID = "prefilter-sample-dossier"
+DOSSIER_ID = SAMPLE_DOSSIER_ID
 
 SHELL_VENDOR = "209101"
 REAL_VENDOR = "209112"
@@ -45,32 +32,16 @@ REPAIR_ASSETS = (
 )
 
 
-@pytest.fixture(scope="module")
-def extracted_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    target = tmp_path_factory.mktemp("prefilter_extract")
-    with zipfile.ZipFile(SAMPLE_ZIP) as zf:
-        zf.extractall(target)
-    (root,) = [p for p in target.iterdir() if p.is_dir()]
-    return root
+@pytest.fixture
+def db_path(sample_saved_db_path: Path) -> Path:
+    return sample_saved_db_path
 
 
-@pytest.fixture(scope="module")
-def db_path(tmp_path_factory: pytest.TempPathFactory, extracted_dir: Path) -> Path:
-    manifest = build_manifest(extracted_dir, DOSSIER_ID)
-    workspace_root = tmp_path_factory.mktemp("prefilter_workspace") / "dossiers" / DOSSIER_ID
-    workspace_root.mkdir(parents=True)
-    normalize_dossier(extracted_dir, workspace_root, manifest, DOSSIER_ID)
-    resolved_db_path = workspace_root.parent.parent / "registry.db"
-
-    graph = build_graph(DOSSIER_ID, resolved_db_path)
-    process_graphs = build_process_graphs(DOSSIER_ID, graph)
-    save_graph(resolved_db_path, DOSSIER_ID, graph, process_graphs)
-    return resolved_db_path
-
-
-@pytest.fixture(scope="module")
-def candidates(db_path: Path):
-    return select_candidate_graphs(DOSSIER_ID, db_path)
+@pytest.fixture(scope="session")
+def candidates(sample_saved_db_path: Path):
+    """Session-scoped: re-selecting per test would load the whole persisted
+    graph again, and this file is already among the slowest in the suite."""
+    return select_candidate_graphs(SAMPLE_DOSSIER_ID, sample_saved_db_path)
 
 
 def _selected_entity_nodes(candidates, prefix: str) -> set[str]:

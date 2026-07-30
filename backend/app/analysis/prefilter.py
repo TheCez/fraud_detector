@@ -185,15 +185,26 @@ def _record_view(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def select_candidate_graphs(dossier_id: str, db_path: Path) -> list[Candidate]:
+def select_candidate_graphs(
+    dossier_id: str,
+    db_path: Path,
+    *,
+    graph: Any | None = None,
+    process_graphs: list[ProcessGraph] | None = None,
+) -> list[Candidate]:
     """Select process graphs worth a model call, with the reason(s) why.
 
-    Loads the whole persisted graph and streams every normalized record for
-    the dossier exactly once - both are cheap local SQLite/in-memory
-    operations, unlike the model calls this function exists to ration.
+    Streams every normalized record for the dossier exactly once - cheap,
+    unlike the model calls this function exists to ration. ``graph``/
+    ``process_graphs`` may be supplied by a caller that already has them in
+    memory (``GraphAnalyzer``, when ``runner.py`` just built and persisted
+    them) to skip reading the whole graph back out of SQLite; when omitted,
+    both are loaded fresh, as before.
     """
-    graph = load_graph(db_path, dossier_id)
-    process_graphs = load_process_graphs(db_path, dossier_id)
+    if graph is None:
+        graph = load_graph(db_path, dossier_id)
+    if process_graphs is None:
+        process_graphs = load_process_graphs(db_path, dossier_id)
 
     records_by_id = {
         row["record_id"]: _record_view(row) for row in iter_records_by_dossier(db_path, dossier_id)

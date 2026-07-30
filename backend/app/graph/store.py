@@ -8,6 +8,7 @@ without ever rebuilding them.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import networkx as nx
@@ -30,8 +31,6 @@ def save_graph(
     graph: nx.MultiDiGraph,
     process_graphs: list[ProcessGraph],
 ) -> None:
-    init_graph_tables(db_path)
-
     node_rows = [
         {
             "node_id": node_id,
@@ -40,8 +39,6 @@ def save_graph(
         }
         for node_id, attrs in graph.nodes(data=True)
     ]
-    bulk_insert_graph_nodes(db_path, dossier_id, node_rows)
-
     edge_rows = [
         {
             "edge_id": attrs["edge_id"],
@@ -52,8 +49,6 @@ def save_graph(
         }
         for source, target, attrs in graph.edges(data=True)
     ]
-    bulk_insert_graph_edges(db_path, dossier_id, edge_rows)
-
     process_graph_rows = [
         {
             "graph_id": pg.graph_id,
@@ -74,7 +69,20 @@ def save_graph(
         }
         for pg in process_graphs
     ]
-    bulk_insert_process_graphs(db_path, dossier_id, process_graph_rows)
+
+    # One connection, one transaction for table creation plus all three bulk
+    # inserts - previously each of these four steps opened its own connection
+    # and committed separately.
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    try:
+        init_graph_tables(db_path, con=con)
+        bulk_insert_graph_nodes(db_path, dossier_id, node_rows, con=con)
+        bulk_insert_graph_edges(db_path, dossier_id, edge_rows, con=con)
+        bulk_insert_process_graphs(db_path, dossier_id, process_graph_rows, con=con)
+        con.commit()
+    finally:
+        con.close()
 
 
 def load_graph(db_path: Path, dossier_id: str) -> nx.MultiDiGraph:

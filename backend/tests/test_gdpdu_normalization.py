@@ -8,56 +8,29 @@ small synthetic GDPdU folders instead.
 
 from __future__ import annotations
 
-import zipfile
 from pathlib import Path
 
 import pytest
 
 from app.ingestion.manifest import ACCOUNTING_FOLDERS, build_manifest
 from app.models.schemas import FileClassification, ParseStatus
-from app.normalization.models import NormalizedRecord
 from app.normalization.orchestrator import normalize_dossier
 from app.normalization.parsers.gdpdu_txt import parse_gdpdu_folder
+from tests.conftest import SAMPLE_DOSSIER_ID, requires_sample_zip
 
-SAMPLE_ZIP = (
-    Path(__file__).resolve().parent.parent.parent
-    / "sample_data"
-    / "Uebungsdaten_Muster_Verpackungen.zip"
-)
-
-requires_sample_zip = pytest.mark.skipif(
-    not SAMPLE_ZIP.exists(), reason="sample ZIP not available"
-)
-
-DOSSIER_ID = "gdpdu-sample-dossier"
+DOSSIER_ID = SAMPLE_DOSSIER_ID
 
 
-@pytest.fixture(scope="module")
-def extracted_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    target = tmp_path_factory.mktemp("gdpdu_extract")
-    with zipfile.ZipFile(SAMPLE_ZIP) as zf:
-        zf.extractall(target)
-    (root,) = [p for p in target.iterdir() if p.is_dir()]
-    return root
+@pytest.fixture
+def extracted_dir(sample_extracted_dir: Path) -> Path:
+    return sample_extracted_dir
 
 
-@pytest.fixture(scope="module")
-def normalized(tmp_path_factory: pytest.TempPathFactory, extracted_dir: Path):
-    """Run the real manifest + normalization pipeline over the extracted sample."""
-    manifest = build_manifest(extracted_dir, DOSSIER_ID)
-
-    workspace_root = tmp_path_factory.mktemp("gdpdu_workspace") / "dossiers" / DOSSIER_ID
-    workspace_root.mkdir(parents=True)
-
-    manifest = normalize_dossier(extracted_dir, workspace_root, manifest, DOSSIER_ID)
-
-    records: list[NormalizedRecord] = []
-    all_records_path = workspace_root / "normalized" / "all_records.jsonl"
-    if all_records_path.exists():
-        for line in all_records_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(NormalizedRecord.model_validate_json(line))
-
+@pytest.fixture
+def normalized(sample_manifest_and_records):
+    """(manifest, records) from the session-shared real-sample pipeline - see
+    conftest.py's ``sample_manifest_and_records``."""
+    manifest, records, _db_path = sample_manifest_and_records
     return manifest, records
 
 

@@ -12,7 +12,6 @@ AV/Anlagen.txt) - the sealed ground-truth file is never read.
 
 from __future__ import annotations
 
-import zipfile
 from pathlib import Path
 
 import pytest
@@ -29,20 +28,9 @@ from app.graph.tools import (
     path_between,
     records_for_node,
 )
-from app.ingestion.manifest import build_manifest
-from app.normalization.orchestrator import normalize_dossier
+from tests.conftest import SAMPLE_DOSSIER_ID, requires_sample_zip
 
-SAMPLE_ZIP = (
-    Path(__file__).resolve().parent.parent.parent
-    / "sample_data"
-    / "Uebungsdaten_Muster_Verpackungen.zip"
-)
-
-requires_sample_zip = pytest.mark.skipif(
-    not SAMPLE_ZIP.exists(), reason="sample ZIP not available"
-)
-
-DOSSIER_ID = "graph-engine-sample-dossier"
+DOSSIER_ID = SAMPLE_DOSSIER_ID
 
 # Shell vendor (no goods receipt) - see task brief.
 SHELL_VENDOR = "209101"
@@ -63,42 +51,29 @@ REPAIR_ASSETS = (
 )
 
 
-@pytest.fixture(scope="module")
-def extracted_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    target = tmp_path_factory.mktemp("graph_extract")
-    with zipfile.ZipFile(SAMPLE_ZIP) as zf:
-        zf.extractall(target)
-    (root,) = [p for p in target.iterdir() if p.is_dir()]
-    return root
+@pytest.fixture
+def extracted_dir(sample_extracted_dir: Path) -> Path:
+    return sample_extracted_dir
 
 
-@pytest.fixture(scope="module")
-def db_path(tmp_path_factory: pytest.TempPathFactory, extracted_dir: Path) -> Path:
-    """Run the real manifest + normalization pipeline, returning the SQLite path
-    normalize_dossier populates (workspace_root.parent.parent / "registry.db")."""
-    manifest = build_manifest(extracted_dir, DOSSIER_ID)
-    workspace_root = tmp_path_factory.mktemp("graph_workspace") / "dossiers" / DOSSIER_ID
-    workspace_root.mkdir(parents=True)
-    normalize_dossier(extracted_dir, workspace_root, manifest, DOSSIER_ID)
-    return workspace_root.parent.parent / "registry.db"
+@pytest.fixture
+def db_path(sample_db_path: Path) -> Path:
+    return sample_db_path
 
 
-@pytest.fixture(scope="module")
-def graph(db_path: Path):
-    return build_graph(DOSSIER_ID, db_path)
+@pytest.fixture
+def graph(sample_graph):
+    return sample_graph
 
 
-@pytest.fixture(scope="module")
-def process_graphs(graph):
-    return build_process_graphs(DOSSIER_ID, graph)
+@pytest.fixture
+def process_graphs(sample_process_graphs):
+    return sample_process_graphs
 
 
-@pytest.fixture(scope="module")
-def saved_db_path(db_path: Path, graph, process_graphs) -> Path:
-    """db_path with the graph persisted - tools.py reads back from storage, it
-    never takes an in-memory graph directly."""
-    save_graph(db_path, DOSSIER_ID, graph, process_graphs)
-    return db_path
+@pytest.fixture
+def saved_db_path(sample_saved_db_path: Path) -> Path:
+    return sample_saved_db_path
 
 
 # ---------------------------------------------------------------------------

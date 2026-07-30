@@ -46,6 +46,8 @@ def run_analysis(dossier_id: str, workspace_root: Path, db_path: Path) -> None:
     run_id = create_analysis_run(db_path, dossier_id, "agent" if settings.agent_enabled else "demo")
 
     try:
+        graph = None
+        process_graphs = None
         if get_record_count(db_path, dossier_id) > 0:
             graph = build_graph(dossier_id, db_path)
             process_graphs = build_process_graphs(dossier_id, graph)
@@ -53,7 +55,11 @@ def run_analysis(dossier_id: str, workspace_root: Path, db_path: Path) -> None:
 
         graph_analyzer: GraphAnalyzer | None = None
         if settings.is_configured:
-            graph_analyzer = GraphAnalyzer(settings)
+            # Pass the graph just built (and persisted) above so the analyzer
+            # does not immediately read the whole thing back out of SQLite.
+            # GraphAnalyzer falls back to loading it itself when record_count
+            # was 0 above and graph/process_graphs are still None.
+            graph_analyzer = GraphAnalyzer(settings, graph=graph, process_graphs=process_graphs)
             findings = graph_analyzer.analyze(dossier_id, db_path)
             mode = "agent"
         elif settings.agent_enabled:

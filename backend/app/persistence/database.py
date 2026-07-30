@@ -47,6 +47,18 @@ ON normalized_records(dossier_id, record_type)
 _BATCH_SIZE = 1000
 
 
+def _as_positional(rows: list[dict], keys: tuple[str, ...]) -> list[tuple]:
+    """Row dicts to positional tuples in ``keys`` order.
+
+    ``sqlite3.Connection.executemany`` with named (``:key``) placeholders does
+    a dict lookup per column per row; with tens of thousands of graph edges,
+    switching to ``?`` positional placeholders measurably cuts bulk-insert
+    time (verified against the real sample dossier). Callers keep passing
+    plain dicts - this is the one place that does the conversion.
+    """
+    return [tuple(row[key] for key in keys) for row in rows]
+
+
 def init_registry(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path)
@@ -130,6 +142,9 @@ def init_normalized_table(db_path: Path) -> None:
         con.close()
 
 
+_RECORD_COLUMNS = ("record_id", "dossier_id", "file_id", "record_type", "date", "amount", "currency", "data_json")
+
+
 def bulk_insert_records(db_path: Path, records: list[dict]) -> int:
     """Insert records in batches. Returns count inserted."""
     if not records:
@@ -139,11 +154,11 @@ def bulk_insert_records(db_path: Path, records: list[dict]) -> int:
     inserted = 0
     try:
         for i in range(0, len(records), _BATCH_SIZE):
-            batch = records[i : i + _BATCH_SIZE]
+            batch = _as_positional(records[i : i + _BATCH_SIZE], _RECORD_COLUMNS)
             con.executemany(
                 "INSERT OR REPLACE INTO normalized_records "
                 "(record_id, dossier_id, file_id, record_type, date, amount, currency, data_json) "
-                "VALUES (:record_id, :dossier_id, :file_id, :record_type, :date, :amount, :currency, :data_json)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
@@ -435,9 +450,18 @@ CREATE INDEX IF NOT EXISTS idx_process_graphs_dossier ON process_graphs(dossier_
 """
 
 
-def init_graph_tables(db_path: Path) -> None:
+def init_graph_tables(db_path: Path, con: sqlite3.Connection | None = None) -> None:
+    """Create the graph tables/indexes if missing.
+
+    Accepts an already-open connection so ``save_graph`` can run table
+    creation plus all three bulk inserts as one transaction instead of one
+    connection (and commit) per step; a bare call without ``con`` still opens
+    and commits its own, as before.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     try:
         con.execute(_CREATE_GRAPH_NODES_TABLE)
         con.execute(_CREATE_GRAPH_EDGES_TABLE)
@@ -447,83 +471,111 @@ def init_graph_tables(db_path: Path) -> None:
         con.execute(_CREATE_GRAPH_EDGES_IDX_SOURCE)
         con.execute(_CREATE_GRAPH_EDGES_IDX_TARGET)
         con.execute(_CREATE_PROCESS_GRAPHS_IDX)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
 
-def bulk_insert_graph_nodes(db_path: Path, dossier_id: str, nodes: list[dict]) -> int:
+_GRAPH_NODE_COLUMNS = ("dossier_id", "node_id", "node_type", "data_json")
+_GRAPH_EDGE_COLUMNS = ("dossier_id", "edge_id", "source", "target", "edge_type", "record_ids_json")
+_PROCESS_GRAPH_COLUMNS = ("dossier_id", "graph_id", "data_json", "record_count")
+
+
+def bulk_insert_graph_nodes(
+    db_path: Path, dossier_id: str, nodes: list[dict], con: sqlite3.Connection | None = None
+) -> int:
     """Insert graph nodes in batches. Each dict needs node_id, node_type, data_json."""
     if not nodes:
         return 0
 
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     inserted = 0
     try:
         for i in range(0, len(nodes), _BATCH_SIZE):
-            batch = [
-                {"dossier_id": dossier_id, **node} for node in nodes[i : i + _BATCH_SIZE]
-            ]
+            batch = _as_positional(
+                [{"dossier_id": dossier_id, **node} for node in nodes[i : i + _BATCH_SIZE]],
+                _GRAPH_NODE_COLUMNS,
+            )
             con.executemany(
                 "INSERT OR REPLACE INTO graph_nodes (dossier_id, node_id, node_type, data_json) "
-                "VALUES (:dossier_id, :node_id, :node_type, :data_json)",
+                "VALUES (?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
     return inserted
 
 
-def bulk_insert_graph_edges(db_path: Path, dossier_id: str, edges: list[dict]) -> int:
+def bulk_insert_graph_edges(
+    db_path: Path, dossier_id: str, edges: list[dict], con: sqlite3.Connection | None = None
+) -> int:
     """Insert graph edges in batches. Each dict needs edge_id, source, target,
     edge_type, record_ids_json."""
     if not edges:
         return 0
 
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     inserted = 0
     try:
         for i in range(0, len(edges), _BATCH_SIZE):
-            batch = [
-                {"dossier_id": dossier_id, **edge} for edge in edges[i : i + _BATCH_SIZE]
-            ]
+            batch = _as_positional(
+                [{"dossier_id": dossier_id, **edge} for edge in edges[i : i + _BATCH_SIZE]],
+                _GRAPH_EDGE_COLUMNS,
+            )
             con.executemany(
                 "INSERT OR REPLACE INTO graph_edges "
                 "(dossier_id, edge_id, source, target, edge_type, record_ids_json) "
-                "VALUES (:dossier_id, :edge_id, :source, :target, :edge_type, :record_ids_json)",
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
     return inserted
 
 
-def bulk_insert_process_graphs(db_path: Path, dossier_id: str, process_graphs: list[dict]) -> int:
+def bulk_insert_process_graphs(
+    db_path: Path, dossier_id: str, process_graphs: list[dict], con: sqlite3.Connection | None = None
+) -> int:
     """Insert process-graph summaries. Each dict needs graph_id, data_json, record_count."""
     if not process_graphs:
         return 0
 
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     inserted = 0
     try:
         for i in range(0, len(process_graphs), _BATCH_SIZE):
-            batch = [
-                {"dossier_id": dossier_id, **pg} for pg in process_graphs[i : i + _BATCH_SIZE]
-            ]
+            batch = _as_positional(
+                [{"dossier_id": dossier_id, **pg} for pg in process_graphs[i : i + _BATCH_SIZE]],
+                _PROCESS_GRAPH_COLUMNS,
+            )
             con.executemany(
                 "INSERT OR REPLACE INTO process_graphs "
                 "(dossier_id, graph_id, data_json, record_count) "
-                "VALUES (:dossier_id, :graph_id, :data_json, :record_count)",
+                "VALUES (?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
     return inserted
 
 

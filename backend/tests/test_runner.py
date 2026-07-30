@@ -147,7 +147,7 @@ def test_model_call_cap_hit_completes_the_run_but_records_the_message(tmp_path: 
     _seed_dossier(db_path, dossier_id)
 
     class _CappedAnalyzer:
-        def __init__(self, settings) -> None:
+        def __init__(self, settings, *, graph=None, process_graphs=None) -> None:
             self.model_call_cap_hit = True
             self.cap_message = "Model-call cap (2) reached: 5 of 5 process graphs..."
 

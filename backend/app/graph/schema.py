@@ -149,6 +149,11 @@ def make_edge(
     edge_type: EdgeType,
     record_ids: Iterable[str],
 ) -> Edge:
+    # Inlines make_edge_id's key construction instead of calling it with the
+    # already-deduped/sorted rid_tuple, which would just repeat the same
+    # sorted(set(...)) - this runs once per edge (100k+ on the real sample
+    # dossier), so the redundant pass was a measurable chunk of build_graph.
     rid_tuple = tuple(sorted(set(record_ids)))
-    edge_id = make_edge_id(dossier_id, source, target, edge_type, rid_tuple)
+    key = f"{dossier_id}|{source}|{target}|{edge_type.value}|{'|'.join(rid_tuple)}"
+    edge_id = uuid.uuid5(_NAMESPACE, key).hex
     return Edge(edge_id=edge_id, source=source, target=target, edge_type=edge_type, record_ids=rid_tuple)

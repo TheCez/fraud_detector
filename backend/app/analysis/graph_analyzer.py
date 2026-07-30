@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, TypedDict
 
+import networkx as nx
 from pydantic import BaseModel, Field
 
 from app.analysis.errors import GraphUnavailableError
@@ -32,6 +35,7 @@ from app.analysis.prefilter import Candidate, select_candidate_graphs
 from app.core.settings import AgentSettings
 from app.evidence import EvidenceRecordStore
 from app.graph.store import load_process_graphs
+from app.graph.subgraphs import ProcessGraph
 from app.graph.tools import (
     absence_check,
     get_subgraph,
@@ -43,6 +47,11 @@ from app.graph.tools import (
 from app.models.schemas import Evidence, Finding, FindingStatus, Severity, SourceLocation
 
 logger = logging.getLogger(__name__)
+
+# Log a progress line every N completed candidate-graph traversals, so a long
+# run (hundreds of candidates, each several tool calls) is observable rather
+# than silent until it finishes or times out.
+_PROGRESS_LOG_INTERVAL = 25
 
 # Maximum tool calls a single process-graph traversal may make. Enforced in
 # code by _build_traversal_graph's routing, not left to the model's judgement -
@@ -183,6 +192,27 @@ def _build_tools(dossier_id: str, db_path: Path) -> list[Any]:
     return [StructuredTool.from_function(func=fn, name=name, description=desc) for fn, name, desc in specs]
 
 
+def _is_systemic_error(exc: BaseException) -> bool:
+    """True for a failure that affects every candidate identically, not just
+    the one graph that happened to surface it first.
+
+    ``GraphUnavailableError`` here can only come from ``_build_models``/
+    ``_build_traversal_graph`` (a missing optional dependency) - a
+    configuration problem, not a per-graph one. An authentication/permission
+    error from the model provider is the same: the credentials are bad for
+    every request, not just this one. Everything else (a tool raising, the
+    model producing something odd, a recursion-limit overflow on one
+    unusually tangled graph) is specific to the candidate that hit it.
+    """
+    if isinstance(exc, GraphUnavailableError):
+        return True
+    try:
+        from openai import AuthenticationError, PermissionDeniedError
+    except ImportError:
+        return False
+    return isinstance(exc, (AuthenticationError, PermissionDeniedError))
+
+
 def _build_traversal_graph(tool_model: Any, proposer_model: Any, tools_by_name: dict[str, Any], step_budget: int):
     """Compile the bounded LangGraph workflow for one process-graph traversal.
 
@@ -278,9 +308,22 @@ class GraphAnalyzer:
       the candidate list.
     """
 
-    def __init__(self, settings: AgentSettings, *, step_budget: int = DEFAULT_STEP_BUDGET) -> None:
+    def __init__(
+        self,
+        settings: AgentSettings,
+        *,
+        step_budget: int = DEFAULT_STEP_BUDGET,
+        graph: nx.MultiDiGraph | None = None,
+        process_graphs: list[ProcessGraph] | None = None,
+    ) -> None:
         self.settings = settings
         self.step_budget = step_budget
+        # Optionally supplied by the caller (runner.py, which already builds
+        # the graph before persisting it) so analyze() need not read it back
+        # out of SQLite. Falls back to a fresh load when not supplied - the
+        # path a bare re-analysis request without a freshly built graph takes.
+        self._graph = graph
+        self._process_graphs = process_graphs
         self.total_process_graphs = 0
         self.candidate_graphs = 0
         self.analyzed_graphs = 0
@@ -291,8 +334,14 @@ class GraphAnalyzer:
         if not self.settings.is_configured:
             raise GraphUnavailableError("Agent analysis is disabled or not configured.")
 
-        candidates = select_candidate_graphs(dossier_id, db_path)
-        self.total_process_graphs = len(load_process_graphs(db_path, dossier_id))
+        if self._graph is not None and self._process_graphs is not None:
+            candidates = select_candidate_graphs(
+                dossier_id, db_path, graph=self._graph, process_graphs=self._process_graphs
+            )
+            self.total_process_graphs = len(self._process_graphs)
+        else:
+            candidates = select_candidate_graphs(dossier_id, db_path)
+            self.total_process_graphs = len(load_process_graphs(db_path, dossier_id))
         self.candidate_graphs = len(candidates)
 
         selected = candidates
@@ -316,19 +365,105 @@ class GraphAnalyzer:
         if not selected:
             return []
 
+        return self._analyze_concurrently(dossier_id, db_path, selected)
+
+    def _analyze_concurrently(
+        self, dossier_id: str, db_path: Path, selected: list[Candidate]
+    ) -> list[Finding]:
+        """Walk every selected candidate graph on a bounded thread pool.
+
+        The work is I/O-bound (HTTPS calls to the model provider), so threads
+        are the right tool - see the task brief. Each worker thread builds and
+        keeps its own ``ChatOpenAI``/compiled-workflow pair (``_thread_workflow``)
+        rather than sharing one across threads, because neither is documented
+        as thread-safe and this project does not guess about that; ``tools``,
+        ``tools_by_name`` and ``store`` are safe to share read-only - every
+        underlying call opens its own SQLite connection (see
+        ``app/persistence/database.py``) and none of these wrapper objects
+        carries mutable per-call state.
+
+        Findings must not depend on completion order: this collects every
+        candidate's findings first and sorts the merged list by finding_id
+        (itself a deterministic uuid5 over the dossier id and sorted record
+        ids - see ``_validate_and_build_findings``) before returning, so a
+        concurrent run and a sequential run (``max_workers=1``) produce
+        identical output for the same stubbed model.
+
+        A per-candidate failure is isolated - logged, counted, the run
+        continues - unless it is an authentication/configuration error or
+        every candidate failed, either of which means the model or graph
+        backend itself is unavailable, not that this one graph was odd; that
+        case raises ``GraphUnavailableError`` so ``runner.py`` records
+        ``analysis_incomplete`` instead of a false "zero findings" report.
+        """
         tools = _build_tools(dossier_id, db_path)
         tools_by_name = {tool.name: tool for tool in tools}
-        tool_model, proposer_model = self._build_models(tools)
-        workflow = _build_traversal_graph(tool_model, proposer_model, tools_by_name, self.step_budget)
-
         store = EvidenceRecordStore(dossier_id, db_path)
-        findings: list[Finding] = []
-        for candidate in selected:
-            proposals = self._investigate(workflow, store, candidate)
-            findings.extend(
-                self._validate_and_build_findings(dossier_id, store, candidate.graph.graph_id, proposals)
+        thread_state = threading.local()
+
+        def _thread_workflow() -> Any:
+            workflow = getattr(thread_state, "workflow", None)
+            if workflow is None:
+                tool_model, proposer_model = self._build_models(tools)
+                workflow = _build_traversal_graph(tool_model, proposer_model, tools_by_name, self.step_budget)
+                thread_state.workflow = workflow
+            return workflow
+
+        def _run_one(candidate: Candidate) -> tuple[Candidate, list[Finding] | None, BaseException | None]:
+            try:
+                workflow = _thread_workflow()
+                proposals = self._investigate(workflow, store, candidate)
+                findings = self._validate_and_build_findings(
+                    dossier_id, store, candidate.graph.graph_id, proposals
+                )
+                return candidate, findings, None
+            except BaseException as exc:  # noqa: BLE001 - isolate per-graph, classify below
+                return candidate, None, exc
+
+        max_workers = max(1, min(self.settings.max_workers, len(selected)))
+        collected: list[Finding] = []
+        failure_count = 0
+        systemic_error: BaseException | None = None
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_one, candidate) for candidate in selected]
+            for future in as_completed(futures):
+                candidate, findings, error = future.result()
+                completed += 1
+                if completed % _PROGRESS_LOG_INTERVAL == 0 or completed == len(selected):
+                    logger.info(
+                        "dossier %s: analyzed %d/%d candidate process graphs",
+                        dossier_id,
+                        completed,
+                        len(selected),
+                    )
+                if error is not None:
+                    failure_count += 1
+                    logger.warning(
+                        "dossier %s: process graph %s failed and was skipped: %s",
+                        dossier_id,
+                        candidate.graph.graph_id,
+                        error,
+                    )
+                    if _is_systemic_error(error) and systemic_error is None:
+                        systemic_error = error
+                    continue
+                collected.extend(findings or [])
+
+        if systemic_error is not None:
+            raise GraphUnavailableError(
+                f"Agent analysis for dossier {dossier_id} failed with an authentication/configuration "
+                f"error, not a per-graph one: {systemic_error}"
+            ) from systemic_error
+        if failure_count == len(selected):
+            raise GraphUnavailableError(
+                f"All {len(selected)} candidate process graph traversals failed for dossier "
+                f"{dossier_id}; the model or graph backend is unavailable."
             )
-        return findings
+
+        collected.sort(key=lambda finding: finding.finding_id)
+        return collected
 
     def _build_models(self, tools: list[Any]) -> tuple[Any, Any]:
         try:
@@ -336,15 +471,19 @@ class GraphAnalyzer:
         except ImportError as exc:
             raise GraphUnavailableError("The optional LangChain OpenAI dependency is not installed.") from exc
 
-        model = ChatOpenAI(model=self.settings.openai_model, api_key=self.settings.openai_api_key, temperature=0)
+        model = ChatOpenAI(
+            model=self.settings.openai_model,
+            api_key=self.settings.openai_api_key,
+            temperature=0,
+            # Explicit rather than relying on langchain_openai's own default:
+            # with several concurrent workers, 429s are expected, and the
+            # underlying OpenAI client already retries 429/5xx with backoff -
+            # this only pins the retry count instead of leaving it implicit.
+            max_retries=3,
+        )
         return model.bind_tools(tools), model.with_structured_output(ProposedFindingBatch)
 
     def _investigate(self, workflow: Any, store: EvidenceRecordStore, candidate: Candidate) -> list[ProposedFinding]:
-        try:
-            from langgraph.errors import GraphRecursionError
-        except ImportError as exc:
-            raise GraphUnavailableError("The optional LangGraph dependency is not installed.") from exc
-
         records = store.resolve(list(candidate.graph.record_ids))
         evidence_context = [store.evidence_context(record) for record in records]
         initial_message = {
@@ -361,15 +500,15 @@ class GraphAnalyzer:
         }
         messages = [{"role": "system", "content": _SYSTEM_PROMPT}, initial_message]
 
-        try:
-            result = workflow.invoke(
-                {"messages": messages, "tool_calls_used": 0},
-                config={"recursion_limit": self.step_budget * 3 + 10},
-            )
-        except GraphRecursionError as exc:
-            raise GraphUnavailableError(
-                f"Traversal of process graph {candidate.graph.graph_id} exceeded its step budget."
-            ) from exc
+        # A recursion overflow (the model still requesting tool calls past the
+        # step budget, tripping LangGraph's own recursion_limit) is specific to
+        # this one candidate's traversal, not the model/backend as a whole - it
+        # propagates like any other per-graph exception and is isolated by the
+        # caller, not converted to GraphUnavailableError here.
+        result = workflow.invoke(
+            {"messages": messages, "tool_calls_used": 0},
+            config={"recursion_limit": self.step_budget * 3 + 10},
+        )
         return result.get("proposals", [])
 
     @staticmethod

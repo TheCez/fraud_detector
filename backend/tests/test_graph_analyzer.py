@@ -29,7 +29,13 @@ from app.persistence import bulk_insert_records, init_normalized_table
 
 
 def _settings(**overrides) -> AgentSettings:
-    defaults = dict(openai_api_key="test-key", openai_model="gpt-test", agent_enabled=True, model_call_cap=100)
+    defaults = dict(
+        openai_api_key="test-key",
+        openai_model="gpt-test",
+        agent_enabled=True,
+        model_call_cap=100,
+        max_workers=4,
+    )
     defaults.update(overrides)
     return AgentSettings(**defaults)
 
@@ -305,7 +311,11 @@ def test_model_call_cap_truncates_candidates_and_records_the_cap_hit(tmp_path: P
     tool_model = _NoToolCallsModel()
     monkeypatch.setattr(GraphAnalyzer, "_build_models", lambda self, tools: (tool_model, proposer_model))
 
-    settings = _settings(model_call_cap=2)
+    # max_workers=1: this test is about cap enforcement, not concurrency - two
+    # threads racing to increment the stub models' plain int counters would
+    # make the exact-count assertions below flaky for a reason unrelated to
+    # what this test checks.
+    settings = _settings(model_call_cap=2, max_workers=1)
     analyzer = GraphAnalyzer(settings)
     findings = analyzer.analyze("dossier-a", db_path)
 
@@ -349,3 +359,194 @@ def test_no_cap_hit_when_candidates_are_within_the_cap(tmp_path: Path, monkeypat
     assert analyzer.model_call_cap_hit is False
     assert analyzer.cap_message is None
     assert analyzer.analyzed_graphs == 1
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: determinism, per-graph isolation, systemic-failure escalation
+# ---------------------------------------------------------------------------
+
+
+class _RecordCitingProposerModel:
+    """Cites whichever record_id this candidate's own initial message carries.
+
+    Reads it back out of ``messages[1]`` (the user message ``_investigate``
+    built from the candidate's own records) so each of several concurrently
+    traversed candidates gets a distinct, correct finding rather than every
+    thread proposing the same canned finding.
+    """
+
+    def invoke(self, messages):
+        user_message = messages[1]
+        content = user_message["content"] if isinstance(user_message, dict) else user_message.content
+        payload = json.loads(content)
+        record_id = payload["records"][0]["record_id"]
+        return ProposedFindingBatch(
+            findings=[
+                ProposedFinding(
+                    title=f"Finding for {record_id}",
+                    severity="medium",
+                    category="review",
+                    explanation="Explanation text long enough to pass validation.",
+                    reasoning="Reasoning text long enough to pass validation.",
+                    confidence="low",
+                    record_ids=[record_id],
+                )
+            ]
+        )
+
+
+def _graph_id_from_messages(messages) -> str:
+    user_message = messages[1]
+    content = user_message["content"] if isinstance(user_message, dict) else user_message.content
+    return json.loads(content)["graph_id"]
+
+
+def test_concurrent_and_sequential_traversal_produce_identical_findings(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "registry.db"
+    init_normalized_table(db_path)
+    record_ids = [f"record-{i}" for i in range(8)]
+    bulk_insert_records(db_path, [_record(rid, "dossier-a") for rid in record_ids])
+
+    fake_candidates = [
+        Candidate(
+            graph=_fake_process_graph(f"PG-{i}", (record_ids[i],)),
+            reasons=("test reason",),
+            signals=("missing_receipt",),
+        )
+        for i in range(8)
+    ]
+    monkeypatch.setattr(
+        "app.analysis.graph_analyzer.select_candidate_graphs", lambda dossier_id, db_path: fake_candidates
+    )
+    monkeypatch.setattr("app.analysis.graph_analyzer.load_process_graphs", lambda db_path, dossier_id: fake_candidates)
+
+    class _NoToolCallsModel:
+        def invoke(self, messages):
+            return AIMessage(content="no tool calls")
+
+    monkeypatch.setattr(
+        GraphAnalyzer, "_build_models", lambda self, tools: (_NoToolCallsModel(), _RecordCitingProposerModel())
+    )
+
+    sequential = GraphAnalyzer(_settings(model_call_cap=100, max_workers=1)).analyze("dossier-a", db_path)
+    concurrent = GraphAnalyzer(_settings(model_call_cap=100, max_workers=8)).analyze("dossier-a", db_path)
+
+    assert len(sequential) == 8
+    assert [f.model_dump(mode="json") for f in sequential] == [f.model_dump(mode="json") for f in concurrent]
+    # Proves the final ordering comes from the deliberate sort, not from
+    # however the threads happened to finish.
+    assert [f.finding_id for f in concurrent] == sorted(f.finding_id for f in concurrent)
+
+
+def test_a_single_candidate_failure_is_isolated_and_does_not_abort_the_run(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "registry.db"
+    init_normalized_table(db_path)
+    bulk_insert_records(db_path, [_record(f"record-{i}", "dossier-a") for i in range(3)])
+
+    fake_candidates = [
+        Candidate(
+            graph=_fake_process_graph(f"PG-{i}", (f"record-{i}",)),
+            reasons=("test reason",),
+            signals=("missing_receipt",),
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(
+        "app.analysis.graph_analyzer.select_candidate_graphs", lambda dossier_id, db_path: fake_candidates
+    )
+    monkeypatch.setattr("app.analysis.graph_analyzer.load_process_graphs", lambda db_path, dossier_id: fake_candidates)
+
+    class _FailsOnOneGraphModel:
+        def invoke(self, messages):
+            if _graph_id_from_messages(messages) == "PG-1":
+                raise RuntimeError("simulated per-graph failure")
+            return AIMessage(content="no tool calls")
+
+    monkeypatch.setattr(
+        GraphAnalyzer, "_build_models", lambda self, tools: (_FailsOnOneGraphModel(), _RecordCitingProposerModel())
+    )
+
+    settings = _settings(model_call_cap=100, max_workers=1)
+    analyzer = GraphAnalyzer(settings)
+    findings = analyzer.analyze("dossier-a", db_path)
+
+    assert {evidence.record_id for finding in findings for evidence in finding.evidence} == {"record-0", "record-2"}
+
+
+def test_every_candidate_failing_raises_graph_unavailable_error(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "registry.db"
+    init_normalized_table(db_path)
+    bulk_insert_records(db_path, [_record(f"record-{i}", "dossier-a") for i in range(3)])
+
+    fake_candidates = [
+        Candidate(
+            graph=_fake_process_graph(f"PG-{i}", (f"record-{i}",)),
+            reasons=("test reason",),
+            signals=("missing_receipt",),
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(
+        "app.analysis.graph_analyzer.select_candidate_graphs", lambda dossier_id, db_path: fake_candidates
+    )
+    monkeypatch.setattr("app.analysis.graph_analyzer.load_process_graphs", lambda db_path, dossier_id: fake_candidates)
+
+    class _AlwaysFailsModel:
+        def invoke(self, messages):
+            raise RuntimeError("simulated systemic failure")
+
+    monkeypatch.setattr(
+        GraphAnalyzer, "_build_models", lambda self, tools: (_AlwaysFailsModel(), _RecordCitingProposerModel())
+    )
+
+    settings = _settings(model_call_cap=100, max_workers=1)
+    with pytest.raises(GraphUnavailableError):
+        GraphAnalyzer(settings).analyze("dossier-a", db_path)
+
+
+def test_an_authentication_error_on_one_candidate_raises_even_with_other_successes(
+    tmp_path: Path, monkeypatch
+):
+    """An authentication error is a configuration problem, not a per-graph one
+    - it must still abort the run with GraphUnavailableError even though other
+    candidates in the same batch happened to succeed first."""
+    import httpx
+    from openai import AuthenticationError
+
+    db_path = tmp_path / "registry.db"
+    init_normalized_table(db_path)
+    bulk_insert_records(db_path, [_record(f"record-{i}", "dossier-a") for i in range(3)])
+
+    fake_candidates = [
+        Candidate(
+            graph=_fake_process_graph(f"PG-{i}", (f"record-{i}",)),
+            reasons=("test reason",),
+            signals=("missing_receipt",),
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(
+        "app.analysis.graph_analyzer.select_candidate_graphs", lambda dossier_id, db_path: fake_candidates
+    )
+    monkeypatch.setattr("app.analysis.graph_analyzer.load_process_graphs", lambda db_path, dossier_id: fake_candidates)
+
+    def _auth_error() -> AuthenticationError:
+        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        response = httpx.Response(401, request=request)
+        return AuthenticationError("invalid api key", response=response, body=None)
+
+    class _AuthFailsOnOneGraphModel:
+        def invoke(self, messages):
+            if _graph_id_from_messages(messages) == "PG-1":
+                raise _auth_error()
+            return AIMessage(content="no tool calls")
+
+    monkeypatch.setattr(
+        GraphAnalyzer,
+        "_build_models",
+        lambda self, tools: (_AuthFailsOnOneGraphModel(), _RecordCitingProposerModel()),
+    )
+
+    settings = _settings(model_call_cap=100, max_workers=1)
+    with pytest.raises(GraphUnavailableError):
+        GraphAnalyzer(settings).analyze("dossier-a", db_path)
