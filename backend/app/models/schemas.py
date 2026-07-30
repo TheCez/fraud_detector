@@ -78,6 +78,7 @@ class Finding(BaseModel):
     confidence: str
     status: FindingStatus
     evidence: list[Evidence] = []
+    graph_id: Optional[str] = None
 
 
 class DossierFile(BaseModel):

@@ -1,6 +1,6 @@
 """
 Normalization orchestrator - routes dossier files to appropriate parsers,
-writes JSONL output for Cognee ingestion, and persists records to SQLite.
+writes a combined JSONL export, and persists records to SQLite.
 """
 
 from __future__ import annotations
@@ -119,7 +119,10 @@ def normalize_dossier(
             else:
                 entry.parse_status = ParseStatus.parsed
 
-    # Write combined JSONL for Cognee bulk ingestion
+    # Write the combined JSONL export. The graph builder reads normalized
+    # records from SQLite, not this file - it exists as a human-readable export
+    # artifact and as the retry endpoint's guard that normalization has run
+    # (api/routes.py checks this file's existence).
     if all_records:
         _write_jsonl(all_records, output_dir / "all_records.jsonl")
 

@@ -47,6 +47,18 @@ ON normalized_records(dossier_id, record_type)
 _BATCH_SIZE = 1000
 
 
+def _as_positional(rows: list[dict], keys: tuple[str, ...]) -> list[tuple]:
+    """Row dicts to positional tuples in ``keys`` order.
+
+    ``sqlite3.Connection.executemany`` with named (``:key``) placeholders does
+    a dict lookup per column per row; with tens of thousands of graph edges,
+    switching to ``?`` positional placeholders measurably cuts bulk-insert
+    time (verified against the real sample dossier). Callers keep passing
+    plain dicts - this is the one place that does the conversion.
+    """
+    return [tuple(row[key] for key in keys) for row in rows]
+
+
 def init_registry(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path)
@@ -130,6 +142,9 @@ def init_normalized_table(db_path: Path) -> None:
         con.close()
 
 
+_RECORD_COLUMNS = ("record_id", "dossier_id", "file_id", "record_type", "date", "amount", "currency", "data_json")
+
+
 def bulk_insert_records(db_path: Path, records: list[dict]) -> int:
     """Insert records in batches. Returns count inserted."""
     if not records:
@@ -139,11 +154,11 @@ def bulk_insert_records(db_path: Path, records: list[dict]) -> int:
     inserted = 0
     try:
         for i in range(0, len(records), _BATCH_SIZE):
-            batch = records[i : i + _BATCH_SIZE]
+            batch = _as_positional(records[i : i + _BATCH_SIZE], _RECORD_COLUMNS)
             con.executemany(
                 "INSERT OR REPLACE INTO normalized_records "
                 "(record_id, dossier_id, file_id, record_type, date, amount, currency, data_json) "
-                "VALUES (:record_id, :dossier_id, :file_id, :record_type, :date, :amount, :currency, :data_json)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
@@ -272,7 +287,7 @@ def init_findings_table(db_path: Path) -> None:
         con.close()
 
 
-# --- Analysis runs and graph ingestion ---
+# --- Analysis runs ---
 
 _CREATE_ANALYSIS_RUNS_TABLE = """
 CREATE TABLE IF NOT EXISTS analysis_runs (
@@ -288,59 +303,14 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
 )
 """
 
-_CREATE_GRAPH_INGESTIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS graph_ingestions (
-    dossier_id TEXT PRIMARY KEY,
-    dataset_name TEXT NOT NULL,
-    normalized_sha256 TEXT NOT NULL,
-    status TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    error TEXT,
-    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
-)
-"""
-
 
 def init_analysis_tables(db_path: Path) -> None:
     con = sqlite3.connect(db_path)
     try:
         con.execute(_CREATE_ANALYSIS_RUNS_TABLE)
-        con.execute(_CREATE_GRAPH_INGESTIONS_TABLE)
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_analysis_runs_dossier "
             "ON analysis_runs(dossier_id, created_at DESC)"
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def get_graph_ingestion(db_path: Path, dossier_id: str) -> dict | None:
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    try:
-        row = con.execute(
-            "SELECT * FROM graph_ingestions WHERE dossier_id = ?", (dossier_id,)
-        ).fetchone()
-        return dict(row) if row is not None else None
-    finally:
-        con.close()
-
-
-def save_graph_ingestion(
-    db_path: Path, dossier_id: str, dataset_name: str, normalized_sha256: str, status: str, error: str | None = None
-) -> None:
-    from datetime import datetime, timezone
-
-    con = sqlite3.connect(db_path)
-    try:
-        con.execute(
-            "INSERT INTO graph_ingestions (dossier_id, dataset_name, normalized_sha256, status, updated_at, error) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(dossier_id) DO UPDATE SET dataset_name = excluded.dataset_name, "
-            "normalized_sha256 = excluded.normalized_sha256, status = excluded.status, "
-            "updated_at = excluded.updated_at, error = excluded.error",
-            (dossier_id, dataset_name, normalized_sha256, status, datetime.now(timezone.utc).isoformat(), error),
         )
         con.commit()
     finally:
@@ -459,6 +429,20 @@ CREATE TABLE IF NOT EXISTS process_graphs (
 )
 """
 
+# A counter bumped every time save_graph rewrites a dossier's graph tables, in
+# the same transaction as that rewrite. Callers that cache the loaded graph in
+# memory (see app/graph/tools.py) key their cache entry on this value instead
+# of a wall-clock signal (mtime, time.time()) - a version bump and the graph
+# data it corresponds to always commit together, so a cache never serves a
+# graph older than the version it claims to be.
+_CREATE_GRAPH_META_TABLE = """
+CREATE TABLE IF NOT EXISTS graph_meta (
+    dossier_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
+)
+"""
+
 _CREATE_GRAPH_NODES_IDX = """
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_dossier ON graph_nodes(dossier_id)
 """
@@ -480,95 +464,133 @@ CREATE INDEX IF NOT EXISTS idx_process_graphs_dossier ON process_graphs(dossier_
 """
 
 
-def init_graph_tables(db_path: Path) -> None:
+def init_graph_tables(db_path: Path, con: sqlite3.Connection | None = None) -> None:
+    """Create the graph tables/indexes if missing.
+
+    Accepts an already-open connection so ``save_graph`` can run table
+    creation plus all three bulk inserts as one transaction instead of one
+    connection (and commit) per step; a bare call without ``con`` still opens
+    and commits its own, as before.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     try:
         con.execute(_CREATE_GRAPH_NODES_TABLE)
         con.execute(_CREATE_GRAPH_EDGES_TABLE)
         con.execute(_CREATE_PROCESS_GRAPHS_TABLE)
+        con.execute(_CREATE_GRAPH_META_TABLE)
         con.execute(_CREATE_GRAPH_NODES_IDX)
         con.execute(_CREATE_GRAPH_EDGES_IDX_DOSSIER)
         con.execute(_CREATE_GRAPH_EDGES_IDX_SOURCE)
         con.execute(_CREATE_GRAPH_EDGES_IDX_TARGET)
         con.execute(_CREATE_PROCESS_GRAPHS_IDX)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
 
-def bulk_insert_graph_nodes(db_path: Path, dossier_id: str, nodes: list[dict]) -> int:
+_GRAPH_NODE_COLUMNS = ("dossier_id", "node_id", "node_type", "data_json")
+_GRAPH_EDGE_COLUMNS = ("dossier_id", "edge_id", "source", "target", "edge_type", "record_ids_json")
+_PROCESS_GRAPH_COLUMNS = ("dossier_id", "graph_id", "data_json", "record_count")
+
+
+def bulk_insert_graph_nodes(
+    db_path: Path, dossier_id: str, nodes: list[dict], con: sqlite3.Connection | None = None
+) -> int:
     """Insert graph nodes in batches. Each dict needs node_id, node_type, data_json."""
     if not nodes:
         return 0
 
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     inserted = 0
     try:
         for i in range(0, len(nodes), _BATCH_SIZE):
-            batch = [
-                {"dossier_id": dossier_id, **node} for node in nodes[i : i + _BATCH_SIZE]
-            ]
+            batch = _as_positional(
+                [{"dossier_id": dossier_id, **node} for node in nodes[i : i + _BATCH_SIZE]],
+                _GRAPH_NODE_COLUMNS,
+            )
             con.executemany(
                 "INSERT OR REPLACE INTO graph_nodes (dossier_id, node_id, node_type, data_json) "
-                "VALUES (:dossier_id, :node_id, :node_type, :data_json)",
+                "VALUES (?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
     return inserted
 
 
-def bulk_insert_graph_edges(db_path: Path, dossier_id: str, edges: list[dict]) -> int:
+def bulk_insert_graph_edges(
+    db_path: Path, dossier_id: str, edges: list[dict], con: sqlite3.Connection | None = None
+) -> int:
     """Insert graph edges in batches. Each dict needs edge_id, source, target,
     edge_type, record_ids_json."""
     if not edges:
         return 0
 
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     inserted = 0
     try:
         for i in range(0, len(edges), _BATCH_SIZE):
-            batch = [
-                {"dossier_id": dossier_id, **edge} for edge in edges[i : i + _BATCH_SIZE]
-            ]
+            batch = _as_positional(
+                [{"dossier_id": dossier_id, **edge} for edge in edges[i : i + _BATCH_SIZE]],
+                _GRAPH_EDGE_COLUMNS,
+            )
             con.executemany(
                 "INSERT OR REPLACE INTO graph_edges "
                 "(dossier_id, edge_id, source, target, edge_type, record_ids_json) "
-                "VALUES (:dossier_id, :edge_id, :source, :target, :edge_type, :record_ids_json)",
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
     return inserted
 
 
-def bulk_insert_process_graphs(db_path: Path, dossier_id: str, process_graphs: list[dict]) -> int:
+def bulk_insert_process_graphs(
+    db_path: Path, dossier_id: str, process_graphs: list[dict], con: sqlite3.Connection | None = None
+) -> int:
     """Insert process-graph summaries. Each dict needs graph_id, data_json, record_count."""
     if not process_graphs:
         return 0
 
-    con = sqlite3.connect(db_path)
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
     inserted = 0
     try:
         for i in range(0, len(process_graphs), _BATCH_SIZE):
-            batch = [
-                {"dossier_id": dossier_id, **pg} for pg in process_graphs[i : i + _BATCH_SIZE]
-            ]
+            batch = _as_positional(
+                [{"dossier_id": dossier_id, **pg} for pg in process_graphs[i : i + _BATCH_SIZE]],
+                _PROCESS_GRAPH_COLUMNS,
+            )
             con.executemany(
                 "INSERT OR REPLACE INTO process_graphs "
                 "(dossier_id, graph_id, data_json, record_count) "
-                "VALUES (:dossier_id, :graph_id, :data_json, :record_count)",
+                "VALUES (?, ?, ?, ?)",
                 batch,
             )
             inserted += len(batch)
-        con.commit()
+        if owns_connection:
+            con.commit()
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
     return inserted
 
 
@@ -596,6 +618,30 @@ def get_graph_edges(db_path: Path, dossier_id: str) -> list[dict]:
         con.close()
 
 
+def clear_graph_tables(db_path: Path, dossier_id: str, con: sqlite3.Connection | None = None) -> None:
+    """Delete every graph_nodes/graph_edges/process_graphs row for dossier_id.
+
+    save_graph calls this before re-inserting. Without it, INSERT OR REPLACE
+    only ever upserts the incoming node/edge/process-graph ids - a rebuilt
+    graph with fewer or different nodes and edges than the one it replaces
+    would leave the removed ones behind as orphaned rows, so a stale node or
+    edge id would keep resolving through load_graph/load_process_graphs
+    after a re-analysis that no longer produces it.
+    """
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
+    try:
+        con.execute("DELETE FROM graph_nodes WHERE dossier_id = ?", (dossier_id,))
+        con.execute("DELETE FROM graph_edges WHERE dossier_id = ?", (dossier_id,))
+        con.execute("DELETE FROM process_graphs WHERE dossier_id = ?", (dossier_id,))
+        if owns_connection:
+            con.commit()
+    finally:
+        if owns_connection:
+            con.close()
+
+
 def get_process_graphs(db_path: Path, dossier_id: str) -> list[dict]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -605,5 +651,40 @@ def get_process_graphs(db_path: Path, dossier_id: str) -> list[dict]:
             (dossier_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def bump_graph_version(db_path: Path, dossier_id: str, con: sqlite3.Connection | None = None) -> int:
+    """Increment and return dossier_id's graph version counter.
+
+    Called by save_graph as part of the same transaction that rewrites the
+    graph tables - see the comment on _CREATE_GRAPH_META_TABLE.
+    """
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO graph_meta (dossier_id, version) VALUES (?, 1) "
+            "ON CONFLICT(dossier_id) DO UPDATE SET version = version + 1",
+            (dossier_id,),
+        )
+        row = con.execute("SELECT version FROM graph_meta WHERE dossier_id = ?", (dossier_id,)).fetchone()
+        version = row[0] if row else 1
+        if owns_connection:
+            con.commit()
+        return version
+    finally:
+        if owns_connection:
+            con.close()
+
+
+def get_graph_version(db_path: Path, dossier_id: str) -> int:
+    """Current graph version for dossier_id, or 0 if no graph has been saved yet."""
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute("SELECT version FROM graph_meta WHERE dossier_id = ?", (dossier_id,)).fetchone()
+        return row[0] if row else 0
     finally:
         con.close()

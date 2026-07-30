@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import networkx as nx
 
-from app.graph.schema import EdgeType, NodeType, record_node_id
+from app.graph.schema import EdgeType, NodeType
 
 logger = logging.getLogger(__name__)
 
@@ -47,46 +47,81 @@ def _make_graph_id(dossier_id: str, record_ids: tuple[str, ...]) -> str:
     return f"PG-{uuid.uuid5(_NAMESPACE, key).hex[:16]}"
 
 
-def _break_cycles_deterministically(sub: nx.MultiDiGraph) -> tuple[nx.MultiDiGraph, bool]:
-    """Return an acyclic view of ``sub`` for source/sink computation.
+def _induced_out_adjacency(
+    graph: nx.MultiDiGraph, induced_nodes: set[str]
+) -> dict[str, list[tuple[str, str]]]:
+    """Out-edges of ``induced_nodes`` whose target is also in ``induced_nodes``.
+
+    Built directly from the full graph rather than via ``graph.subgraph()``:
+    a lazy ``SubGraph`` view's per-call overhead (iterated through networkx's
+    backend-dispatch machinery) dominated this module's runtime when called
+    once per process graph on a large dossier - profiled at ~9s of a ~20s
+    ``build_process_graphs`` run on the real sample dossier, almost all of it
+    inside ``is_directed_acyclic_graph``/``topological_sort`` on the view
+    rather than in this module's own logic. A process graph's induced node
+    set is small, and every node in it already has its real out-edges walked
+    directly (not via a view) a few lines above this function's call site -
+    the same direct-access pattern reused here.
+    """
+    adjacency: dict[str, list[tuple[str, str]]] = {node: [] for node in induced_nodes}
+    for node in induced_nodes:
+        for _source, target, key in graph.out_edges(node, keys=True):
+            if target in induced_nodes:
+                adjacency[node].append((target, key))
+    return adjacency
+
+
+def _break_cycles_deterministically(
+    induced_nodes: set[str], out_adjacency: dict[str, list[tuple[str, str]]]
+) -> tuple[dict[str, int], dict[str, int], bool]:
+    """In/out degree of the induced subgraph after breaking cycles, plus
+    whether it had one.
 
     Cycles can appear: e.g. vendor entity -(has_receipt)-> goods_receipt record
-    -(document_join)-> vendor invoice record -(paid_to)-> vendor entity. Rather than
-    crash or silently claim acyclicity, drop DFS back-edges in a fixed, sorted
-    visitation order - a standard, deterministic feedback-arc-set approximation.
-    The full edge set (including whatever gets dropped here) is untouched in the
-    persisted graph; this view exists only to compute in/out degree honestly.
-    """
-    if nx.is_directed_acyclic_graph(sub):
-        return sub, False
+    -(document_join)-> vendor invoice record -(paid_to)-> vendor entity. Rather
+    than crash or silently claim acyclicity, this drops DFS back-edges in a
+    fixed, sorted visitation order - a standard, deterministic feedback-arc-set
+    approximation. The full edge set (including whatever gets dropped here) is
+    untouched in the persisted graph; this exists only to compute in/out degree
+    honestly for source/sink node selection.
 
-    dag = nx.MultiDiGraph()
-    dag.add_nodes_from(sub.nodes(data=True))
+    Iterative rather than recursive - a per-node stack frame here would put a
+    hard, silent cap on how long a chain of document-joined records can be
+    before this raises ``RecursionError``.
+    """
+    out_degree = dict.fromkeys(induced_nodes, 0)
+    in_degree = dict.fromkeys(induced_nodes, 0)
     visited: set[str] = set()
     in_stack: set[str] = set()
     dropped = 0
 
-    def dfs(node: str) -> None:
-        nonlocal dropped
-        visited.add(node)
-        in_stack.add(node)
-        out_edges = sorted(sub.out_edges(node, keys=True, data=True), key=lambda e: (e[1], e[2]))
-        for _source, target, key, data in out_edges:
-            if target in in_stack:
-                dropped += 1
-                continue
-            if target not in visited:
-                dag.add_edge(node, target, key=key, **data)
-                dfs(target)
-            else:
-                dag.add_edge(node, target, key=key, **data)
-        in_stack.discard(node)
+    for start in sorted(induced_nodes):
+        if start in visited:
+            continue
+        visited.add(start)
+        in_stack.add(start)
+        stack = [(start, iter(sorted(out_adjacency[start])))]
 
-    for node in sorted(sub.nodes):
-        if node not in visited:
-            dfs(node)
+        while stack:
+            node, edges = stack[-1]
+            pushed = False
+            for target, _key in edges:
+                if target in in_stack:
+                    dropped += 1
+                    continue
+                out_degree[node] += 1
+                in_degree[target] += 1
+                if target not in visited:
+                    visited.add(target)
+                    in_stack.add(target)
+                    stack.append((target, iter(sorted(out_adjacency[target]))))
+                    pushed = True
+                    break
+            if not pushed:
+                stack.pop()
+                in_stack.discard(node)
 
-    return dag, dropped > 0
+    return in_degree, out_degree, dropped > 0
 
 
 def build_process_graphs(
@@ -123,9 +158,9 @@ def build_process_graphs(
                     entity_node_ids.add(u)
 
         induced_nodes = record_node_set | entity_node_ids
-        sub = graph.subgraph(induced_nodes)
+        out_adjacency = _induced_out_adjacency(graph, induced_nodes)
 
-        dag_view, had_cycle = _break_cycles_deterministically(sub)
+        in_degree, out_degree, had_cycle = _break_cycles_deterministically(induced_nodes, out_adjacency)
         if had_cycle:
             cycle_count += 1
             logger.debug(
@@ -135,8 +170,8 @@ def build_process_graphs(
                 record_ids,
             )
 
-        source_node_ids = tuple(sorted(n for n in dag_view.nodes if dag_view.in_degree(n) == 0))
-        sink_node_ids = tuple(sorted(n for n in dag_view.nodes if dag_view.out_degree(n) == 0))
+        source_node_ids = tuple(sorted(n for n in induced_nodes if in_degree[n] == 0))
+        sink_node_ids = tuple(sorted(n for n in induced_nodes if out_degree[n] == 0))
 
         capped = len(record_ids) > max_records_per_subgraph
         if capped:

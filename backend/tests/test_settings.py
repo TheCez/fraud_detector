@@ -12,9 +12,24 @@ def test_agent_settings_are_isolated_from_the_developer_env_by_default():
     result = AgentSettings.from_environment()
 
     assert result.agent_enabled is False
-    assert result.cognee_api_key is None
-    assert result.cognee_service_url is None
     assert result.openai_api_key is None
+    assert result.is_configured is False
+
+
+def test_is_configured_requires_only_agent_enabled_and_openai_key(monkeypatch):
+    monkeypatch.setenv("FRAUD_AGENT_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    result = AgentSettings.from_environment()
+
+    assert result.is_configured is True
+
+
+def test_model_call_cap_has_a_default_and_is_overridable(monkeypatch):
+    assert AgentSettings.from_environment().model_call_cap > 0
+
+    monkeypatch.setenv("FRAUD_AGENT_MODEL_CALL_CAP", "7")
+    assert AgentSettings.from_environment().model_call_cap == 7
 
 
 def test_load_local_environment_uses_project_env_file_without_overriding_process_env(

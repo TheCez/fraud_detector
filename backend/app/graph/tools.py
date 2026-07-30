@@ -6,16 +6,100 @@ function here is dossier-scoped, returns plain serializable data (never a
 NetworkX object), and enforces an explicit bound - a default limit on every list
 return, a maximum path length, no unbounded traversal. An LLM must never be able
 to pull an entire dossier into a prompt through this API.
+
+Every function takes optional ``graph``/``process_graphs`` keyword arguments.
+A caller that already holds the loaded graph in memory (``GraphAnalyzer``,
+which receives it from ``runner.py`` right after building it) supplies it and
+the function never touches SQLite at all. A caller with no graph to hand in -
+the future findings chat agent, the graph API endpoints - gets one transparently
+from ``_GraphCache`` below: a small, bounded, thread-safe cache keyed by
+(dossier_id, db_path) and validated against ``get_graph_version``, so repeated
+tool calls across one investigation load the graph once instead of once per
+call, without ever serving a graph older than the version it claims to be.
 """
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import networkx as nx
 
-from app.graph.store import load_graph, load_process_graphs
+from app.graph.store import get_graph_version, load_graph, load_process_graphs
+from app.graph.subgraphs import ProcessGraph
 from app.persistence.database import get_record_by_id
+
+# Small and bounded on purpose: a per-dossier graph is ~42k nodes/~110k edges
+# on the real sample dossier, so caching more than a handful at once would
+# leak memory across dossiers rather than just amortizing one investigation's
+# repeated tool calls.
+_CACHE_MAX_ENTRIES = 4
+
+
+class _GraphCacheEntry:
+    __slots__ = ("version", "graph", "process_graphs")
+
+    def __init__(self, version: int, graph: nx.MultiDiGraph, process_graphs: list[ProcessGraph]) -> None:
+        self.version = version
+        self.graph = graph
+        self.process_graphs = process_graphs
+
+
+class _GraphCache:
+    """Bounded LRU cache of (graph, process_graphs) per (dossier_id, db_path).
+
+    Validity is checked against ``get_graph_version`` on every access, not
+    trusted between accesses - cheap (an indexed single-row lookup) next to a
+    multi-second graph rebuild, and it is what guarantees a re-analysis that
+    rewrites the persisted graph is never served stale from here: version and
+    graph data always commit together (see ``save_graph``), so a version
+    mismatch is the only signal this cache needs.
+    """
+
+    def __init__(self, max_entries: int = _CACHE_MAX_ENTRIES) -> None:
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._entries: "OrderedDict[tuple[str, str], _GraphCacheEntry]" = OrderedDict()
+
+    def get(self, dossier_id: str, db_path: Path) -> tuple[nx.MultiDiGraph, list[ProcessGraph]]:
+        key = (dossier_id, str(db_path))
+        current_version = get_graph_version(db_path, dossier_id)
+
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry.version == current_version:
+                self._entries.move_to_end(key)
+                return entry.graph, entry.process_graphs
+
+        graph = load_graph(db_path, dossier_id)
+        process_graphs = load_process_graphs(db_path, dossier_id)
+
+        with self._lock:
+            self._entries[key] = _GraphCacheEntry(current_version, graph, process_graphs)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+        return graph, process_graphs
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_CACHE = _GraphCache()
+
+
+def _cached_graph(dossier_id: str, db_path: Path) -> nx.MultiDiGraph:
+    graph, _process_graphs = _CACHE.get(dossier_id, db_path)
+    return graph
+
+
+def _cached_process_graphs(dossier_id: str, db_path: Path) -> list[ProcessGraph]:
+    _graph, process_graphs = _CACHE.get(dossier_id, db_path)
+    return process_graphs
+
 
 _HARD_MAX_LIMIT = 200
 _DEFAULT_LIST_LIMIT = 50
@@ -37,11 +121,16 @@ def list_process_graphs(
     *,
     limit: int = _DEFAULT_LIST_LIMIT,
     offset: int = 0,
+    process_graphs: list[ProcessGraph] | None = None,
 ) -> list[dict]:
     """Summaries only - graph_id, record_count, and flags. Use get_subgraph for
-    the full node/edge payload of one graph."""
+    the full node/edge payload of one graph.
+
+    Supply ``process_graphs`` when the caller already has it in memory to skip
+    the load entirely; otherwise it comes from the bounded per-dossier cache."""
     bounded_limit = _bounded_limit(limit, _DEFAULT_LIST_LIMIT)
-    process_graphs = load_process_graphs(db_path, dossier_id)
+    if process_graphs is None:
+        process_graphs = _cached_process_graphs(dossier_id, db_path)
     page = process_graphs[offset : offset + bounded_limit]
     return [
         {
@@ -57,14 +146,27 @@ def list_process_graphs(
     ]
 
 
-def get_subgraph(dossier_id: str, db_path: Path, graph_id: str) -> dict | None:
-    """Full node/edge payload for one process graph, serializable to JSON."""
-    process_graphs = load_process_graphs(db_path, dossier_id)
+def get_subgraph(
+    dossier_id: str,
+    db_path: Path,
+    graph_id: str,
+    *,
+    graph: nx.MultiDiGraph | None = None,
+    process_graphs: list[ProcessGraph] | None = None,
+) -> dict | None:
+    """Full node/edge payload for one process graph, serializable to JSON.
+
+    Supply ``graph``/``process_graphs`` when the caller already has them in
+    memory to skip the load entirely; otherwise they come from the bounded
+    per-dossier cache."""
+    if process_graphs is None:
+        process_graphs = _cached_process_graphs(dossier_id, db_path)
     target = next((pg for pg in process_graphs if pg.graph_id == graph_id), None)
     if target is None:
         return None
 
-    graph = load_graph(db_path, dossier_id)
+    if graph is None:
+        graph = _cached_graph(dossier_id, db_path)
     record_node_ids = {f"record:{rid}" for rid in target.record_ids}
     node_ids = record_node_ids | set(target.entity_node_ids)
 
@@ -90,10 +192,15 @@ def neighbors(
     *,
     edge_type: str | None = None,
     limit: int = _DEFAULT_NEIGHBOR_LIMIT,
+    graph: nx.MultiDiGraph | None = None,
 ) -> list[dict]:
-    """Bounded one-hop neighbors of node_id, in either direction."""
+    """Bounded one-hop neighbors of node_id, in either direction.
+
+    Supply ``graph`` when the caller already has it in memory to skip the
+    load entirely; otherwise it comes from the bounded per-dossier cache."""
     bounded_limit = _bounded_limit(limit, _DEFAULT_NEIGHBOR_LIMIT)
-    graph = load_graph(db_path, dossier_id)
+    if graph is None:
+        graph = _cached_graph(dossier_id, db_path)
     if not graph.has_node(node_id):
         return []
 
@@ -121,11 +228,16 @@ def records_for_node(
     node_id: str,
     *,
     limit: int = _DEFAULT_RECORDS_LIMIT,
+    graph: nx.MultiDiGraph | None = None,
 ) -> list[dict]:
     """Normalized records backing node_id - itself if it's a record node, plus
-    every record any incident edge cites as justification."""
+    every record any incident edge cites as justification.
+
+    Supply ``graph`` when the caller already has it in memory to skip the
+    load entirely; otherwise it comes from the bounded per-dossier cache."""
     bounded_limit = _bounded_limit(limit, _DEFAULT_RECORDS_LIMIT)
-    graph = load_graph(db_path, dossier_id)
+    if graph is None:
+        graph = _cached_graph(dossier_id, db_path)
     if not graph.has_node(node_id):
         return []
 
@@ -171,14 +283,19 @@ def path_between(
     target_node_id: str,
     *,
     max_len: int = _DEFAULT_MAX_PATH_LEN,
+    graph: nx.MultiDiGraph | None = None,
 ) -> dict | None:
     """Shortest path between two nodes, bounded to max_len hops.
 
     Traverses the undirected view so record/entity edge direction never blocks
     finding a path that clearly exists in the underlying graph.
+
+    Supply ``graph`` when the caller already has it in memory to skip the
+    load entirely; otherwise it comes from the bounded per-dossier cache.
     """
     bounded_max_len = max(1, min(max_len, _HARD_MAX_PATH_LEN))
-    graph = load_graph(db_path, dossier_id)
+    if graph is None:
+        graph = _cached_graph(dossier_id, db_path)
     if not graph.has_node(source_node_id) or not graph.has_node(target_node_id):
         return None
 
@@ -205,11 +322,22 @@ def path_between(
     }
 
 
-def absence_check(dossier_id: str, db_path: Path, node_id: str, expected_edge_type: str) -> dict:
+def absence_check(
+    dossier_id: str,
+    db_path: Path,
+    node_id: str,
+    expected_edge_type: str,
+    *,
+    graph: nx.MultiDiGraph | None = None,
+) -> dict:
     """Answer "does node_id have an edge of expected_edge_type" directly, with
     enough detail for a caller to explain the conclusion either way (e.g. "this
-    vendor has no goods receipt")."""
-    graph = load_graph(db_path, dossier_id)
+    vendor has no goods receipt").
+
+    Supply ``graph`` when the caller already has it in memory to skip the
+    load entirely; otherwise it comes from the bounded per-dossier cache."""
+    if graph is None:
+        graph = _cached_graph(dossier_id, db_path)
     if not graph.has_node(node_id):
         return {
             "node_id": node_id,

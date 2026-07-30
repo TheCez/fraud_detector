@@ -8,6 +8,7 @@ without ever rebuilding them.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import networkx as nx
@@ -17,8 +18,11 @@ from app.persistence.database import (
     bulk_insert_graph_edges,
     bulk_insert_graph_nodes,
     bulk_insert_process_graphs,
+    bump_graph_version,
+    clear_graph_tables,
     get_graph_edges,
     get_graph_nodes,
+    get_graph_version,
     get_process_graphs,
     init_graph_tables,
 )
@@ -30,8 +34,6 @@ def save_graph(
     graph: nx.MultiDiGraph,
     process_graphs: list[ProcessGraph],
 ) -> None:
-    init_graph_tables(db_path)
-
     node_rows = [
         {
             "node_id": node_id,
@@ -40,8 +42,6 @@ def save_graph(
         }
         for node_id, attrs in graph.nodes(data=True)
     ]
-    bulk_insert_graph_nodes(db_path, dossier_id, node_rows)
-
     edge_rows = [
         {
             "edge_id": attrs["edge_id"],
@@ -52,8 +52,6 @@ def save_graph(
         }
         for source, target, attrs in graph.edges(data=True)
     ]
-    bulk_insert_graph_edges(db_path, dossier_id, edge_rows)
-
     process_graph_rows = [
         {
             "graph_id": pg.graph_id,
@@ -74,7 +72,29 @@ def save_graph(
         }
         for pg in process_graphs
     ]
-    bulk_insert_process_graphs(db_path, dossier_id, process_graph_rows)
+
+    # One connection, one transaction for table creation, clearing this
+    # dossier's previous rows, all three bulk inserts, and the version bump -
+    # previously each step opened its own connection and committed separately.
+    # Clearing first (rather than relying on INSERT OR REPLACE alone) is what
+    # makes a rebuild with fewer or different nodes/edges than before actually
+    # replace the persisted graph instead of leaving old rows orphaned
+    # alongside the new ones. Bumping the version in the same transaction is
+    # what lets app/graph/tools.py's cache trust it: a reader can never
+    # observe a new version without also seeing the graph data it corresponds
+    # to.
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    try:
+        init_graph_tables(db_path, con=con)
+        clear_graph_tables(db_path, dossier_id, con=con)
+        bulk_insert_graph_nodes(db_path, dossier_id, node_rows, con=con)
+        bulk_insert_graph_edges(db_path, dossier_id, edge_rows, con=con)
+        bulk_insert_process_graphs(db_path, dossier_id, process_graph_rows, con=con)
+        bump_graph_version(db_path, dossier_id, con=con)
+        con.commit()
+    finally:
+        con.close()
 
 
 def load_graph(db_path: Path, dossier_id: str) -> nx.MultiDiGraph:
@@ -117,4 +137,4 @@ def load_process_graphs(db_path: Path, dossier_id: str) -> list[ProcessGraph]:
     return process_graphs
 
 
-__all__ = ["save_graph", "load_graph", "load_process_graphs"]
+__all__ = ["save_graph", "load_graph", "load_process_graphs", "get_graph_version"]
