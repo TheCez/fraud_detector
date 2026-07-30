@@ -13,7 +13,7 @@ ZIP  ->  inventory  ->  normalize  ->  graph  ->  analyze  ->  findings + eviden
 - **Inventory** records every archive entry, including the technical metadata it will not analyze, and rejects unsafe paths, links and resource-exhausting archives. Originals are never modified.
 - **Normalize** parses GDPdU delimited tables (using each folder's `index.xml` for column definitions), CSV, XLSX, DOCX and PDF into one record envelope that keeps every raw German field plus exact provenance - file, sheet, page, row.
 - **Graph** turns those records into nodes and edges: vendors, customers, accounts, users, assets, and the documents joining them. Records are clustered into per-transaction *process graphs*, each with a start and an end. Every edge stores the record ids that justify it.
-- **Analyze** produces findings. The default is deterministic and needs no credentials. Optionally, an agent walks each process graph and applies audit knowledge to spot discrepancies.
+- **Analyze** produces findings. The default is deterministic and needs no credentials. Optionally, each process graph - one ledger entry, with its records, parties, relationships and what comparable entries carry that it lacks - is assembled into a single brief and judged by a model in one call. The model is directed at what to compare; no fraud pattern is encoded anywhere.
 
 ## Running it
 
@@ -46,6 +46,7 @@ When something goes wrong - a model is unreachable, a graph fails to build - the
 | `agents/PLAN.md` | the shared work queue |
 | `agents/PROJECT_SPEC.md` | the immutable initial-milestone specification |
 | `.codex/skills/` | domain workflows for dossier engineering |
+| `agents/PROMPTS.md` | every prompt in the pipeline, and the doctrine behind them |
 | `.claude/skills/` | Claude Code workflows for this repo |
 
 The `cognee` branch preserves an earlier implementation that used a cloud graph service. It is kept for reference and is not merged into `main`.
