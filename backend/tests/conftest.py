@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.analysis.profile import build_profile
 from app.graph.builder import build_graph
 from app.graph.store import save_graph
 from app.graph.subgraphs import build_process_graphs
@@ -114,3 +115,14 @@ def sample_saved_db_path(sample_db_path: Path, sample_graph, sample_process_grap
     back from storage, it never takes an in-memory graph directly."""
     save_graph(sample_db_path, SAMPLE_DOSSIER_ID, sample_graph, sample_process_graphs)
     return sample_db_path
+
+
+@pytest.fixture(scope="session")
+def sample_profile(sample_saved_db_path: Path, sample_graph, sample_process_graphs):
+    """Session-scoped like the fixtures above and for the same reason: building
+    the profile is a full pass over the sample dossier's ~32.8k records and
+    ~110k edges, and both test_profile.py and test_entry_brief.py need it -
+    without this shared fixture each file would build it separately."""
+    return build_profile(
+        SAMPLE_DOSSIER_ID, sample_saved_db_path, graph=sample_graph, process_graphs=sample_process_graphs
+    )
