@@ -37,23 +37,26 @@ The `cognee` branch is a preservation snapshot of the Cognee-based implementatio
 
 ## Active queue - Slice 6: local graph engine
 
-### T1 - Graph foundation
+### T1 - Graph foundation - **done** (PR #7)
 
-- **Status:** in review
-- **Owner:** subagent `graph-engine`
-- **Goal:** `backend/app/graph/` - build a `MultiDiGraph` from normalized records, enumerate per-transaction process subgraphs, persist nodes and edges, and expose a bounded typed query API.
-- **Files:** `backend/app/graph/` (new), `backend/app/persistence/database.py`, `backend/pyproject.toml`
-- **Acceptance:** every edge carries the `record_ids` that justify it; construction is deterministic; no process subgraph holds more than a modest fraction of all records (the hub-node guard); `save`/`load` round-trips losslessly.
+`backend/app/graph/` builds a `MultiDiGraph` from normalized records, enumerates per-transaction process graphs, persists them, and exposes a bounded typed query API. Every edge carries the `record_ids` that justify it, construction is deterministic, and `save`/`load` round-trips losslessly.
 
-### T2 - Graph-traversing analyzer, and Cognee deleted
+The design risk was hub collapse: high-degree accounts and users would glue the dossier into one component, making "walk each graph one by one" meaningless. Process graphs are therefore clustered by `document_join` rather than raw connected components, with a fan-out cap that excludes document ids referenced by too many records - on the real data that caught `AfA` and `AB-2024`, batch markers sitting in the `BELEGNUMMER` column. Result: 4,902 process graphs, largest holding 12 of 32,821 records. A guard test fails if any single subgraph exceeds 5% of all records.
 
-- **Status:** in review
-- **Owner:** subagent `graph-analyzer`
-- **Depends on:** T1
-- **Goal:** `analysis/graph_analyzer.py` walks one process graph at a time using the T1 tool API, with a red-flag briefing and a hard step budget. Move `EvidenceRecordStore` into the empty `app/evidence/` package - it is Cognee-independent and is the correctness guarantee. Then remove `CogneeCloudGraph`, the cloud payload filter, the `graph_ingestions` flow, and the Cognee settings.
-- **Files:** `backend/app/analysis/`, `backend/app/evidence/`, `backend/app/core/settings.py`, `.env.example`, `backend/tests/test_cloud_graph.py`
-- **Acceptance:** the model still cannot express evidence text - it cites `record_ids` only, and a proposal is discarded whole if any ID fails to resolve. `GraphUnavailableError` and the `analysis_incomplete` degraded path keep working, now meaning the model or the graph build failed. Cost is bounded per subgraph.
-- **What landed:** `app/analysis/prefilter.py` adds a cheap, deterministic, recall-oriented pre-filter (vendor-with-no-receipt, self-approved master-data changes, repair-worded assets, round amounts, near-round-threshold payment clusters, booking/service period mismatches) that narrows the sample dossier's 4,902 process graphs down substantially before any model call - see the PR body for the exact count. `app/analysis/graph_analyzer.py`'s `GraphAnalyzer` walks each selected graph with a bounded LangGraph agent (hard step budget, enforced by the traversal graph's routing) over the T1 tool API, plus a hard per-run model-call cap (`AgentSettings.model_call_cap`) that is logged and recorded - never silently swallowed - when hit. `EvidenceRecordStore` moved to `app/evidence/store.py` unchanged in behavior. `runner.py` now builds and persists the local graph whenever normalization produces records, regardless of analyzer mode. All Cognee code, settings, and the `graph_ingestions` table/flow are deleted; see the PR's grep output.
+### T2 - Graph-traversing analyzer, Cognee deleted, and made fast - **done** (PR #8)
+
+`app/analysis/prefilter.py` selects which process graphs are worth a model call; `app/analysis/graph_analyzer.py` walks them with bounded LangGraph agents over the T1 tool API. `EvidenceRecordStore` moved to `app/evidence/store.py`. All Cognee code, settings, tests and the `graph_ingestions` flow are gone; `is_configured` is now `agent_enabled and openai_api_key`.
+
+Four things worth remembering, because each was a real defect rather than a design choice:
+
+- **The cap was a lottery.** Taking `candidates[:cap]` from a list ordered by uuid5 meant an effectively random third was analyzed. Candidates are now ranked by signal specificity so the cap truncates the weakest. Only ~44 of ~1,650 candidates carry a strong signal, so unranked selection could drop a vendor paid with no goods receipt in favour of a graph whose only distinction was a round number.
+- **Splitting detection was semantically wrong** - it fired on any two smallish amounts. It now requires a same-day cluster whose combined total crosses the threshold.
+- **`save_graph` only upserted**, so rebuilding a smaller graph left orphaned rows and a re-analysis could serve phantom nodes. Found only by requiring a test for the "never serve a stale graph" claim rather than accepting it.
+- **Every `tools.py` call reloaded the whole graph** (~3.4s), costing ~22s per candidate traversal before any model latency - and since NetworkX construction is GIL-bound, concurrency alone could not have fixed it.
+
+Performance: archive to findings went from 64.1s to ~23s on the deterministic path, per-candidate graph loading from 22.4s to 0.04s, and traversal now runs on a bounded worker pool with findings sorted deterministically. The test suite went from 899s to ~333s.
+
+The model-call cap was deliberately **not** tuned to where the known findings rank. That would repeat the mistake of the deleted cloud payload filter, whose thresholds had been quietly fitted to the answer key.
 
 ### T3 - Graph API seams for chat and UI
 
@@ -73,7 +76,9 @@ The `cognee` branch is a preservation snapshot of the Cognee-based implementatio
 - **Files:** a new evaluation module under `backend/tests/`
 - **Acceptance:** the four seeded findings are reported and **none** of the seven decoys is accused - the mid-year vendor that *does* have four-eyes approval and real deliveries is the sharpest discriminator. The sealed file is read only by the evaluator and never reaches the model. Because the analyzer traverses with an LLM, results vary run to run: report across several runs, not one.
 
-T1 must merge before T2 starts, since T2 consumes the tool API. T3 and T4 can run in parallel after T2 - their file sets are disjoint.
+T1 and T2 are merged. T3 and T4 can run in parallel - their file sets are disjoint.
+
+**T4 will be the first work to spend a real model call.** Nothing has exercised a live call yet, so `OPENAI_MODEL` (default `gpt-5.4`) is unverified, and per-graph latency is unmeasured - which means the model-call cap has never been chosen against a real run time. Expect to tune it once T4 produces the first honest number.
 
 ## Invariants for every task
 

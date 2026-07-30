@@ -1,32 +1,26 @@
-# React + TypeScript + Vite
+# Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React + TypeScript + Vite dashboard for the audit-dossier reviewer. Upload a dossier, browse its files and normalized records, and read findings with their source evidence.
 
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev        # dev server, expects the backend on its default port
+npx vitest run     # tests
+npx oxlint         # lint
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+The backend must be running for anything beyond the mock data in `src/api/mock-data.ts`:
+
+```bash
+cd ../backend && uvicorn app.main:app --reload
+```
+
+## Layout
+
+- `src/pages/` - the two screens, upload and dashboard
+- `src/api/` - client and mock data
+- `src/types/models.ts` - types mirroring the backend's `app/models/schemas.py`
+
+## What to preserve when changing this
+
+Every displayed claim must trace to evidence the backend supplied - never render a figure the API did not return alongside its source location. `analysis_incomplete` is a real state and must stay visually distinct from "no findings": a dossier whose analysis failed must not look like a clean one. See `AGENTS.md` and `PROJECT_CONTEXT.md`.

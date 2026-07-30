@@ -2,7 +2,12 @@
 
 This repository follows the canonical instructions in [AGENTS.md](AGENTS.md). Read it first, then read `PROJECT_CONTEXT.md` and `agents/PLAN.md` before making changes.
 
-Reusable project workflows live in `.codex/skills/`. Use the skill relevant to the active vertical slice.
+Reusable project workflows live in two places, split by what they are about:
+
+- `.codex/skills/` - **domain** workflows: how to build and change this application. `dossier-engineering` for ingestion, normalization, evidence and dashboard slices; `dossier-agent-integration` for the graph engine and the analysis agent. Read the one matching the active slice before touching it.
+- `.claude/skills/` - **working** workflows for this repo: `dispatch-subagent` for briefing and verifying subagents, `sample-dossier` for the sample data's identifiers and performance measurement, `publish-repo` for publishing a repository.
+
+Keep a workflow in one place only. If a domain rule and a working rule seem to conflict, the domain rule wins.
 
 ## Secrets
 
