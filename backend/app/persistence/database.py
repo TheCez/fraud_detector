@@ -429,6 +429,20 @@ CREATE TABLE IF NOT EXISTS process_graphs (
 )
 """
 
+# A counter bumped every time save_graph rewrites a dossier's graph tables, in
+# the same transaction as that rewrite. Callers that cache the loaded graph in
+# memory (see app/graph/tools.py) key their cache entry on this value instead
+# of a wall-clock signal (mtime, time.time()) - a version bump and the graph
+# data it corresponds to always commit together, so a cache never serves a
+# graph older than the version it claims to be.
+_CREATE_GRAPH_META_TABLE = """
+CREATE TABLE IF NOT EXISTS graph_meta (
+    dossier_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    FOREIGN KEY (dossier_id) REFERENCES dossiers(id)
+)
+"""
+
 _CREATE_GRAPH_NODES_IDX = """
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_dossier ON graph_nodes(dossier_id)
 """
@@ -466,6 +480,7 @@ def init_graph_tables(db_path: Path, con: sqlite3.Connection | None = None) -> N
         con.execute(_CREATE_GRAPH_NODES_TABLE)
         con.execute(_CREATE_GRAPH_EDGES_TABLE)
         con.execute(_CREATE_PROCESS_GRAPHS_TABLE)
+        con.execute(_CREATE_GRAPH_META_TABLE)
         con.execute(_CREATE_GRAPH_NODES_IDX)
         con.execute(_CREATE_GRAPH_EDGES_IDX_DOSSIER)
         con.execute(_CREATE_GRAPH_EDGES_IDX_SOURCE)
@@ -603,6 +618,30 @@ def get_graph_edges(db_path: Path, dossier_id: str) -> list[dict]:
         con.close()
 
 
+def clear_graph_tables(db_path: Path, dossier_id: str, con: sqlite3.Connection | None = None) -> None:
+    """Delete every graph_nodes/graph_edges/process_graphs row for dossier_id.
+
+    save_graph calls this before re-inserting. Without it, INSERT OR REPLACE
+    only ever upserts the incoming node/edge/process-graph ids - a rebuilt
+    graph with fewer or different nodes and edges than the one it replaces
+    would leave the removed ones behind as orphaned rows, so a stale node or
+    edge id would keep resolving through load_graph/load_process_graphs
+    after a re-analysis that no longer produces it.
+    """
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
+    try:
+        con.execute("DELETE FROM graph_nodes WHERE dossier_id = ?", (dossier_id,))
+        con.execute("DELETE FROM graph_edges WHERE dossier_id = ?", (dossier_id,))
+        con.execute("DELETE FROM process_graphs WHERE dossier_id = ?", (dossier_id,))
+        if owns_connection:
+            con.commit()
+    finally:
+        if owns_connection:
+            con.close()
+
+
 def get_process_graphs(db_path: Path, dossier_id: str) -> list[dict]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -612,5 +651,40 @@ def get_process_graphs(db_path: Path, dossier_id: str) -> list[dict]:
             (dossier_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def bump_graph_version(db_path: Path, dossier_id: str, con: sqlite3.Connection | None = None) -> int:
+    """Increment and return dossier_id's graph version counter.
+
+    Called by save_graph as part of the same transaction that rewrites the
+    graph tables - see the comment on _CREATE_GRAPH_META_TABLE.
+    """
+    owns_connection = con is None
+    if owns_connection:
+        con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO graph_meta (dossier_id, version) VALUES (?, 1) "
+            "ON CONFLICT(dossier_id) DO UPDATE SET version = version + 1",
+            (dossier_id,),
+        )
+        row = con.execute("SELECT version FROM graph_meta WHERE dossier_id = ?", (dossier_id,)).fetchone()
+        version = row[0] if row else 1
+        if owns_connection:
+            con.commit()
+        return version
+    finally:
+        if owns_connection:
+            con.close()
+
+
+def get_graph_version(db_path: Path, dossier_id: str) -> int:
+    """Current graph version for dossier_id, or 0 if no graph has been saved yet."""
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute("SELECT version FROM graph_meta WHERE dossier_id = ?", (dossier_id,)).fetchone()
+        return row[0] if row else 0
     finally:
         con.close()

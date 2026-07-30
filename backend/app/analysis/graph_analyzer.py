@@ -127,32 +127,43 @@ class _TraversalState(TypedDict, total=False):
     proposals: list[ProposedFinding]
 
 
-def _build_tools(dossier_id: str, db_path: Path) -> list[Any]:
+def _build_tools(
+    dossier_id: str,
+    db_path: Path,
+    *,
+    graph: nx.MultiDiGraph | None = None,
+    process_graphs: list[ProcessGraph] | None = None,
+) -> list[Any]:
     """Bind the T1 tool API (app.graph.tools) to one dossier for the model to call.
 
     Every function here is already bounded and dossier-scoped; this only
     curries dossier_id/db_path so the model only ever supplies the meaningful
-    arguments (node ids, edge types, limits).
+    arguments (node ids, edge types, limits). When ``graph``/``process_graphs``
+    are supplied (``GraphAnalyzer`` already has them - see ``runner.py``),
+    they are curried in too, so every tool call during this traversal reads
+    the in-memory graph directly instead of hitting SQLite - each traversal
+    used to cost one full graph reload per tool call (~3.4s on the sample
+    dossier) before this.
     """
     from langchain_core.tools import StructuredTool
 
     def _list_process_graphs(limit: int = 20, offset: int = 0) -> list[dict]:
-        return list_process_graphs(dossier_id, db_path, limit=limit, offset=offset)
+        return list_process_graphs(dossier_id, db_path, limit=limit, offset=offset, process_graphs=process_graphs)
 
     def _get_subgraph(graph_id: str) -> dict | None:
-        return get_subgraph(dossier_id, db_path, graph_id)
+        return get_subgraph(dossier_id, db_path, graph_id, graph=graph, process_graphs=process_graphs)
 
     def _neighbors(node_id: str, edge_type: str | None = None, limit: int = 20) -> list[dict]:
-        return neighbors(dossier_id, db_path, node_id, edge_type=edge_type, limit=limit)
+        return neighbors(dossier_id, db_path, node_id, edge_type=edge_type, limit=limit, graph=graph)
 
     def _records_for_node(node_id: str, limit: int = 20) -> list[dict]:
-        return records_for_node(dossier_id, db_path, node_id, limit=limit)
+        return records_for_node(dossier_id, db_path, node_id, limit=limit, graph=graph)
 
     def _path_between(source_node_id: str, target_node_id: str, max_len: int = 6) -> dict | None:
-        return path_between(dossier_id, db_path, source_node_id, target_node_id, max_len=max_len)
+        return path_between(dossier_id, db_path, source_node_id, target_node_id, max_len=max_len, graph=graph)
 
     def _absence_check(node_id: str, expected_edge_type: str) -> dict:
-        return absence_check(dossier_id, db_path, node_id, expected_edge_type)
+        return absence_check(dossier_id, db_path, node_id, expected_edge_type, graph=graph)
 
     specs = [
         (
@@ -380,7 +391,11 @@ class GraphAnalyzer:
         ``tools_by_name`` and ``store`` are safe to share read-only - every
         underlying call opens its own SQLite connection (see
         ``app/persistence/database.py``) and none of these wrapper objects
-        carries mutable per-call state.
+        carries mutable per-call state. ``tools`` is bound to ``self._graph``/
+        ``self._process_graphs`` (see ``_build_tools``) when the caller
+        supplied them, so every worker reads the same in-memory graph rather
+        than each reloading it from SQLite - still safe to share read-only,
+        since nothing in app/graph/tools.py ever mutates the graph it's given.
 
         Findings must not depend on completion order: this collects every
         candidate's findings first and sorts the merged list by finding_id
@@ -396,7 +411,7 @@ class GraphAnalyzer:
         case raises ``GraphUnavailableError`` so ``runner.py`` records
         ``analysis_incomplete`` instead of a false "zero findings" report.
         """
-        tools = _build_tools(dossier_id, db_path)
+        tools = _build_tools(dossier_id, db_path, graph=self._graph, process_graphs=self._process_graphs)
         tools_by_name = {tool.name: tool for tool in tools}
         store = EvidenceRecordStore(dossier_id, db_path)
         thread_state = threading.local()
