@@ -94,6 +94,17 @@ _ENTITY_COLUMN_MAP: dict[str, tuple[str, str | None]] = {
     "anlagen_nr": ("asset", None),
 }
 
+# Type-discriminator columns: a column whose value names the subledger that a
+# generic account column on the same row actually belongs to (column name ->
+# {discriminator value -> entity type}). ART=Kreditor/Debitor is the
+# discriminator in this export; other formats could add their own.
+_ACCOUNT_TYPE_DISCRIMINATOR_MAP: dict[str, dict[str, str]] = {
+    "art": {
+        "kreditor": "vendor",
+        "debitor": "customer",
+    },
+}
+
 # Relationship extraction: column patterns that yield labeled relationships
 # (without creating a separate entity node)
 _RELATIONSHIP_COLUMN_MAP: dict[str, str] = {
@@ -240,6 +251,25 @@ def _is_label_column(col_name: str) -> bool:
     return any(lower.endswith(suffix) for suffix in label_suffixes)
 
 
+def _resolve_account_type_discriminator(
+    columns: list[str],
+    row_data: dict[str, str | int | float | None],
+) -> str | None:
+    """
+    Look for a type-discriminator column on this row (e.g. ART=Kreditor) and
+    return the entity type it names for a generic account column, or None if
+    no discriminator column is present or its value is unrecognized.
+    """
+    for col in columns:
+        value_map = _ACCOUNT_TYPE_DISCRIMINATOR_MAP.get(col.lower())
+        if value_map is None:
+            continue
+        value = row_data.get(col)
+        if isinstance(value, str) and value.strip():
+            return value_map.get(value.strip().lower())
+    return None
+
+
 def _extract_entities_and_relationships(
     columns: list[str],
     row_data: dict[str, str | int | float | None],
@@ -250,6 +280,7 @@ def _extract_entities_and_relationships(
     """
     entities: list[EntityRef] = []
     relationships: dict[str, str] = {}
+    resolved_account_type = _resolve_account_type_discriminator(columns, row_data)
 
     for col in columns:
         col_lower = col.lower()
@@ -267,6 +298,15 @@ def _extract_entities_and_relationships(
         # Check entity mapping
         for pattern, (entity_type, rel_label) in _ENTITY_COLUMN_MAP.items():
             if pattern in col_lower:
+                # A row-level discriminator retypes only the column it
+                # actually names (KONTO), not any column that merely
+                # substring-matches the "konto" pattern above. A counter
+                # account is still a counter account: ART=Kreditor says what
+                # KONTO is, it says nothing about GEGENKONTO or SACHKONTO,
+                # and retyping those would invent a vendor out of the other
+                # side of the posting.
+                if col_lower == "konto" and resolved_account_type:
+                    entity_type = resolved_account_type
                 entities.append(
                     EntityRef(
                         entity_type=entity_type,

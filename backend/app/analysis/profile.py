@@ -42,6 +42,12 @@ from app.persistence.database import iter_records_by_dossier
 # changer/approver were.
 _MASTER_DATA_RECORD_TYPES = ("master_data", "master_change")
 
+# Small fixed cap on how many master-data record ids one EntityProfile carries
+# verbatim (see EntityProfile.master_data_record_ids) - so a pathological
+# entity with many master-data records cannot blow up a brief. The full count
+# is unaffected by this cap - it stays in master_data_reference_count.
+MASTER_DATA_RECORD_ID_BUDGET = 5
+
 # Entity types that represent an external business counterparty rather than an
 # internal reference. See app/normalization/models.py's EntityRef docstring:
 # "vendor", "customer", "account", "user", "asset", "document", "cost_center"
@@ -98,6 +104,11 @@ class EntityProfile:
     mean_amount: float | None
     edge_type_counts: dict[str, int]
     master_data_reference_count: int
+    # The record ids (sorted, capped at MASTER_DATA_RECORD_ID_BUDGET) of the
+    # master_data/master_change records that name this entity - lets a brief
+    # render each one in full rather than only the count above, which never
+    # applies this cap.
+    master_data_record_ids: tuple[str, ...]
     # Every other entity node (account, user, asset, vendor, customer - any
     # entity type) this entity co-occurs on at least one shared record with.
     # Not the same thing as a vendor/customer "counterparty" (see
@@ -294,9 +305,10 @@ def build_profile(
         entity_amounts = [
             record_meta[rid][2] for rid in rec_ids if rid in record_meta and record_meta[rid][2] is not None
         ]
-        master_count = sum(
-            1 for rid in rec_ids if rid in record_meta and record_meta[rid][0] in _MASTER_DATA_RECORD_TYPES
+        master_record_ids = sorted(
+            rid for rid in rec_ids if rid in record_meta and record_meta[rid][0] in _MASTER_DATA_RECORD_TYPES
         )
+        master_count = len(master_record_ids)
         counterparties: set[str] = set()
         for rid in rec_ids:
             counterparties |= record_entities.get(rid, set())
@@ -314,6 +326,7 @@ def build_profile(
             mean_amount=(sum(entity_amounts) / len(entity_amounts)) if entity_amounts else None,
             edge_type_counts=full_counts,
             master_data_reference_count=master_count,
+            master_data_record_ids=tuple(master_record_ids[:MASTER_DATA_RECORD_ID_BUDGET]),
             co_occurring_entity_count=len(counterparties),
         )
 
@@ -397,6 +410,7 @@ def build_profile(
 
 __all__ = [
     "COMPLETENESS_DIMENSIONS",
+    "MASTER_DATA_RECORD_ID_BUDGET",
     "DossierProfile",
     "EntityProfile",
     "EntryCompleteness",

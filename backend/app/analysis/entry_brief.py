@@ -21,6 +21,10 @@ violation, or a concern:
 - a companion record type or edge type that peer entries of the same shape
   carry and this entry does not.
 
+An identity-dimension absence is only printed when at least one peer entry of
+the same shape supplies that dimension - a zero-of-N line would only say the
+absence is normal for this shape, which is noise, not an observation.
+
 Deciding whether either kind of absence matters is the next stage's job
 (a data-quality gate, then a model), not this module's - this module never
 returns anything shaped like a verdict, a requirement, or a concern score.
@@ -284,30 +288,40 @@ def _render_timeline_section(context: _EntryContext) -> str:
     return _apply_budget("\n".join(lines), TIMELINE_SECTION_BUDGET)
 
 
+def _render_record_lines(record: dict[str, Any]) -> list[str]:
+    """Render one record's source location and every ``COLUMN: value`` field -
+    the exact rendering the Records section uses. Shared with the Parties
+    section so a party's own master-data records render identically rather
+    than through a second, drifting implementation."""
+    lines = []
+    source = record.get("source") or {}
+    location_bits = [source.get("relative_path", "unknown source")]
+    if source.get("sheet"):
+        location_bits.append(f"sheet {source['sheet']}")
+    if source.get("row_number") is not None:
+        row_bit = f"row {source['row_number']}"
+        if source.get("row_end") is not None and source["row_end"] != source["row_number"]:
+            row_bit += f"-{source['row_end']}"
+        location_bits.append(row_bit)
+    if source.get("page") is not None:
+        location_bits.append(f"page {source['page']}")
+    if source.get("paragraph") is not None:
+        location_bits.append(f"paragraph {source['paragraph']}")
+
+    lines.append(f"Record {record['record_id']} ({record['record_type']})")
+    lines.append(f"  Source: {', '.join(location_bits)}")
+    data = record.get("data") or {}
+    for column in sorted(data):
+        lines.append(f"  {column}: {_render_field_value(data[column])}")
+    if record.get("text_content"):
+        lines.append(f"  text_content: {record['text_content']}")
+    return lines
+
+
 def _render_records_section(context: _EntryContext) -> str:
     lines = ["Records"]
     for record in context.records:
-        source = record.get("source") or {}
-        location_bits = [source.get("relative_path", "unknown source")]
-        if source.get("sheet"):
-            location_bits.append(f"sheet {source['sheet']}")
-        if source.get("row_number") is not None:
-            row_bit = f"row {source['row_number']}"
-            if source.get("row_end") is not None and source["row_end"] != source["row_number"]:
-                row_bit += f"-{source['row_end']}"
-            location_bits.append(row_bit)
-        if source.get("page") is not None:
-            location_bits.append(f"page {source['page']}")
-        if source.get("paragraph") is not None:
-            location_bits.append(f"paragraph {source['paragraph']}")
-
-        lines.append(f"Record {record['record_id']} ({record['record_type']})")
-        lines.append(f"  Source: {', '.join(location_bits)}")
-        data = record.get("data") or {}
-        for column in sorted(data):
-            lines.append(f"  {column}: {_render_field_value(data[column])}")
-        if record.get("text_content"):
-            lines.append(f"  text_content: {record['text_content']}")
+        lines.extend(_render_record_lines(record))
     return _apply_budget("\n".join(lines), RECORDS_SECTION_BUDGET)
 
 
@@ -340,7 +354,12 @@ def _entity_profile_line(profile: DossierProfile, entity_node_id: str) -> str:
     )
 
 
-def _render_parties_section(profile: DossierProfile, context: _EntryContext) -> str:
+def _render_parties_section(
+    dossier_id: str, db_path: Path, profile: DossierProfile, context: _EntryContext
+) -> str:
+    own_record_ids = {record["record_id"] for record in context.records}
+    store = EvidenceRecordStore(dossier_id, db_path)
+
     lines = ["Parties"]
     for entity_node_id in context.process_graph.entity_node_ids:
         roles = context.roles_by_entity.get(entity_node_id, [])
@@ -352,6 +371,33 @@ def _render_parties_section(profile: DossierProfile, context: _EntryContext) -> 
         lines.append(f"Party {entity_node_id}")
         lines.append(f"  Roles in this entry: {role_text}")
         lines.append(_entity_profile_line(profile, entity_node_id))
+
+        entity_profile = profile.entities.get(entity_node_id)
+        master_data_record_ids = entity_profile.master_data_record_ids if entity_profile else ()
+        # Only pull in a party's sibling master-data records when this entry
+        # already carries one of that party's own master-data records - i.e.
+        # this entry is that party's master row, split from its master_change
+        # by document_join clustering (see profile.py's module docstring).
+        # An entity that merely appears as a counterparty/account reference
+        # with no master-data record of its own in this entry gets nothing
+        # extra here - otherwise every entry touching a party that ever had
+        # *any* master-data change anywhere in the dossier would inline it,
+        # which is most entries in a real dossier.
+        own_master_data_ids = [rid for rid in master_data_record_ids if rid in own_record_ids]
+        other_record_ids = [rid for rid in master_data_record_ids if rid not in own_record_ids]
+        if own_master_data_ids and other_record_ids:
+            resolved = {
+                record["record_id"]: record
+                for record in (
+                    EvidenceRecordStore.evidence_context(raw) for raw in store.resolve(other_record_ids)
+                )
+            }
+            lines.append("  Master-data records:")
+            for record_id in other_record_ids:
+                record = resolved.get(record_id)
+                if record is None:
+                    continue
+                lines.extend(f"  {line}" for line in _render_record_lines(record))
     return _apply_budget("\n".join(lines), PARTIES_SECTION_BUDGET)
 
 
@@ -402,6 +448,10 @@ def _identity_absence_lines(profile: DossierProfile, graph_id: str) -> list[str]
         if getattr(completeness, f"has_{dimension}"):
             continue
         peer_count = shape_profile.completeness_counts.get(dimension, 0)
+        if peer_count == 0:
+            # No peer of this shape supplies it either - the absence is
+            # normal for this shape, not something worth reporting as noise.
+            continue
         label = _IDENTITY_DIMENSION_LABELS[dimension]
         lines.append(
             f"No record in this entry supplies {label}; {peer_count} of "
@@ -494,7 +544,7 @@ def render_entry_brief(
         _render_entry_section(profile, context),
         _render_timeline_section(context),
         _render_records_section(context),
-        _render_parties_section(profile, context),
+        _render_parties_section(dossier_id, db_path, profile, context),
         _render_relationships_section(context),
         _render_not_present_section(profile, graph_id),
         _render_conventions_section(context),

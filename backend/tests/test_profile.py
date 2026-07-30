@@ -20,7 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.profile import COMPLETENESS_DIMENSIONS, build_profile
+from app.analysis.profile import COMPLETENESS_DIMENSIONS, MASTER_DATA_RECORD_ID_BUDGET, build_profile
+from app.evidence import EvidenceRecordStore
 from app.graph.builder import build_graph
 from app.graph.schema import EdgeType, entity_node_id
 from app.graph.subgraphs import build_process_graphs
@@ -85,6 +86,23 @@ def test_shell_vendor_record_count_matches_direct_graph_inspection(profile, samp
         rid for u, v, d in sample_graph.in_edges(vendor_node, data=True) if d["edge_type"] == ET.paid_to.value for rid in d["record_ids"]
     }
     assert profile.entities[vendor_node].record_count >= len(direct_record_ids)
+
+
+@requires_sample_zip
+def test_shell_vendor_master_data_record_ids_are_a_sorted_tuple_of_real_master_type_records(
+    profile, sample_saved_db_path: Path
+):
+    entity_profile = profile.entities[entity_node_id("vendor", SHELL_VENDOR)]
+    record_ids = entity_profile.master_data_record_ids
+
+    assert record_ids, "expected at least one master-data record id for the shell vendor"
+    assert record_ids == tuple(sorted(record_ids))
+
+    store = EvidenceRecordStore(SAMPLE_DOSSIER_ID, sample_saved_db_path)
+    resolved = store.resolve(list(record_ids))
+    assert len(resolved) == len(record_ids)
+    for record in resolved:
+        assert record["record_type"] in ("master_data", "master_change")
 
 
 @requires_sample_zip
@@ -311,6 +329,31 @@ def test_profile_determinism_holds_on_a_synthetic_dossier_too(completeness_dossi
     dossier_id, db_path, graph, process_graphs, first = completeness_dossier
     second = build_profile(dossier_id, db_path, graph=graph, process_graphs=process_graphs)
     assert first == second
+
+
+def test_master_data_record_ids_are_capped_but_the_full_count_is_not(tmp_path: Path):
+    dossier_id = "master-data-cap-dossier"
+    db_path = tmp_path / "registry.db"
+    total = MASTER_DATA_RECORD_ID_BUDGET + 3
+    record_ids = [f"MD{i:02d}" for i in range(total)]
+    rows = [
+        _row(
+            record_id,
+            dossier_id,
+            "master_change",
+            date=f"2024-01-{i + 1:02d}",
+            data={"GEAENDERT_VON": f"u{i}"},
+            entities=[{"entity_type": "vendor", "entity_id": "700001"}],
+        )
+        for i, record_id in enumerate(record_ids)
+    ]
+    graph, process_graphs = _build(dossier_id, db_path, rows)
+    profile = build_profile(dossier_id, db_path, graph=graph, process_graphs=process_graphs)
+
+    entity_profile = profile.entities[entity_node_id("vendor", "700001")]
+    assert entity_profile.master_data_reference_count == total
+    assert len(entity_profile.master_data_record_ids) == MASTER_DATA_RECORD_ID_BUDGET
+    assert entity_profile.master_data_record_ids == tuple(sorted(record_ids)[:MASTER_DATA_RECORD_ID_BUDGET])
 
 
 # ---------------------------------------------------------------------------

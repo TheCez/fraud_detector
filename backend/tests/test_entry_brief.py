@@ -18,8 +18,10 @@ import pytest
 from app.analysis import entry_brief
 from app.analysis.entry_brief import render_entry_brief, render_entry_summary
 from app.analysis.profile import build_profile
+from app.evidence import EvidenceRecordStore
+from app.graph.schema import entity_node_id
 from tests.conftest import SAMPLE_DOSSIER_ID, requires_sample_zip
-from tests.test_profile import _build, _graph_id_for, _row, completeness_dossier  # noqa: F401 - fixture import
+from tests.test_profile import SHELL_VENDOR, _build, _graph_id_for, _row, completeness_dossier  # noqa: F401 - fixture import
 
 DOSSIER_ID = SAMPLE_DOSSIER_ID
 
@@ -183,6 +185,43 @@ def test_no_real_entry_in_the_sample_dossier_is_truncated_or_incomplete(
     )
 
 
+@requires_sample_zip
+def test_shell_vendor_master_change_fields_surface_in_the_master_rows_entry_brief(
+    sample_saved_db_path: Path, sample_graph, sample_process_graphs, sample_profile
+):
+    """The shell vendor's master row (Kreditoren/Lieferanten.txt) carries only
+    address/tax fields - who changed and approved it lives in a separate
+    master_change record that document_join clustering puts in a different
+    process graph. The Parties section must pull that sibling record's fields
+    into the master row's own entry brief, or the changer/approver are
+    invisible to a model reading that entry alone."""
+    vendor_node = entity_node_id("vendor", SHELL_VENDOR)
+    master_data_record_ids = sample_profile.entities[vendor_node].master_data_record_ids
+    assert master_data_record_ids
+
+    store = EvidenceRecordStore(DOSSIER_ID, sample_saved_db_path)
+    records_by_id = {record["record_id"]: record for record in store.resolve(list(master_data_record_ids))}
+    master_row_record_id = next(
+        record_id for record_id in master_data_record_ids if records_by_id[record_id]["record_type"] == "master_data"
+    )
+    master_row_graph_id = next(
+        pg.graph_id for pg in sample_process_graphs if master_row_record_id in pg.record_ids
+    )
+
+    brief = render_entry_brief(
+        DOSSIER_ID,
+        sample_saved_db_path,
+        master_row_graph_id,
+        sample_profile,
+        graph=sample_graph,
+        process_graphs=sample_process_graphs,
+    )
+
+    assert "GEAENDERT_VON" in brief
+    assert "GENEHMIGT_VON" in brief
+    assert "MV-U05" in brief
+
+
 # ---------------------------------------------------------------------------
 # Synthetic dossiers
 # ---------------------------------------------------------------------------
@@ -301,6 +340,63 @@ def test_summary_carries_the_same_not_present_facts_as_the_full_brief(completene
     assert "No record in this entry supplies a date; 2 of 3 entries with this shape do." in summary
     assert "1 of 3 entries with this shape carry a approved_by edge; this entry does not." in summary
     assert len(summary) <= entry_brief.SUMMARY_BUDGET
+
+
+def test_parties_section_does_not_repeat_a_record_already_shown_in_records_section(completeness_dossier):
+    """M1 is a master_data record naming vendor 400001, and M1 is the only
+    record in its own entry - so its Parties section has nothing new to add
+    for that vendor, and must not print M1's fields a second time under
+    ``Master-data records:``."""
+    dossier_id, db_path, graph, process_graphs, profile = completeness_dossier
+    m1_graph_id = _graph_id_for(process_graphs, "M1")
+
+    brief = render_entry_brief(dossier_id, db_path, m1_graph_id, profile, graph=graph, process_graphs=process_graphs)
+
+    assert brief.count("GEAENDERT_VON: u1") == 1
+    assert "Master-data records:" not in brief
+
+
+@pytest.fixture
+def all_absent_dimension_dossier(tmp_path: Path):
+    """Two single-record master_data entries of the same shape: neither ever
+    supplies a document reference (peer count 0 for that dimension across the
+    shape), while only one of the two supplies a date (peer count 1 - a real,
+    non-zero comparison to keep alongside the suppressed one)."""
+    dossier_id = "all-absent-dossier"
+    db_path = tmp_path / "registry.db"
+    rows = [
+        _row(
+            "B1",
+            dossier_id,
+            "master_data",
+            date="2024-01-01",
+            amount=100.0,
+            data={"X": "1"},
+            entities=[{"entity_type": "vendor", "entity_id": "500001"}],
+        ),
+        _row(
+            "B2",
+            dossier_id,
+            "master_data",
+            date=None,
+            amount=200.0,
+            data={"X": "2"},
+            entities=[{"entity_type": "vendor", "entity_id": "500002"}],
+        ),
+    ]
+    graph, process_graphs = _build(dossier_id, db_path, rows)
+    profile = build_profile(dossier_id, db_path, graph=graph, process_graphs=process_graphs)
+    return dossier_id, db_path, graph, process_graphs, profile
+
+
+def test_not_present_suppresses_zero_peer_count_lines_but_keeps_nonzero_ones(all_absent_dimension_dossier):
+    dossier_id, db_path, graph, process_graphs, profile = all_absent_dimension_dossier
+    b2_graph_id = _graph_id_for(process_graphs, "B2")
+
+    brief = render_entry_brief(dossier_id, db_path, b2_graph_id, profile, graph=graph, process_graphs=process_graphs)
+
+    assert "source-document reference" not in brief
+    assert "No record in this entry supplies a date; 1 of 2 entries with this shape do." in brief
 
 
 def test_summary_truncates_with_a_marker_when_the_overall_budget_is_exceeded(monkeypatch, completeness_dossier):
