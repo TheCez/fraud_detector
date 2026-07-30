@@ -7,7 +7,7 @@ from pathlib import Path
 
 from app.analysis.demo_analyzer import DemoAnalyzer
 from app.analysis.errors import GraphUnavailableError
-from app.analysis.graph_analyzer import GraphAnalyzer
+from app.analysis.pipeline import AnalysisPipeline
 from app.core.settings import AgentSettings
 from app.graph.builder import build_graph
 from app.graph.store import save_graph
@@ -53,14 +53,14 @@ def run_analysis(dossier_id: str, workspace_root: Path, db_path: Path) -> None:
             process_graphs = build_process_graphs(dossier_id, graph)
             save_graph(db_path, dossier_id, graph, process_graphs)
 
-        graph_analyzer: GraphAnalyzer | None = None
+        pipeline: AnalysisPipeline | None = None
         if settings.is_configured:
-            # Pass the graph just built (and persisted) above so the analyzer
+            # Pass the graph just built (and persisted) above so the pipeline
             # does not immediately read the whole thing back out of SQLite.
-            # GraphAnalyzer falls back to loading it itself when record_count
-            # was 0 above and graph/process_graphs are still None.
-            graph_analyzer = GraphAnalyzer(settings, graph=graph, process_graphs=process_graphs)
-            findings = graph_analyzer.analyze(dossier_id, db_path)
+            # AnalysisPipeline falls back to loading it itself when
+            # record_count was 0 above and graph/process_graphs are still None.
+            pipeline = AnalysisPipeline(settings, graph=graph, process_graphs=process_graphs)
+            findings = pipeline.analyze(dossier_id, db_path)
             mode = "agent"
         elif settings.agent_enabled:
             raise GraphUnavailableError(
@@ -72,7 +72,7 @@ def run_analysis(dossier_id: str, workspace_root: Path, db_path: Path) -> None:
 
         insert_findings(db_path, dossier_id, [finding.model_dump(mode="json") for finding in findings])
 
-        cap_message = graph_analyzer.cap_message if graph_analyzer and graph_analyzer.model_call_cap_hit else None
+        cap_message = pipeline.cap_message if pipeline and pipeline.model_call_cap_hit else None
         complete_analysis_run(db_path, run_id, "complete", mode=mode, error=cap_message)
         update_dossier_status(db_path, dossier_id, "complete", finding_count=len(findings))
     except GraphUnavailableError as exc:
