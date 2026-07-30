@@ -165,8 +165,13 @@ _FORBIDDEN_PROMPT_PHRASES = (
     "segregation-of-duties",
     "round amount",
     "round number",
-    "goods receipt",
-    "goods-receipt",
+    # "goods receipt" is deliberately NOT forbidden. It is a document type -
+    # one of the observables the doctrine in `agents/PROMPTS.md` explicitly
+    # allows a prompt to name, exactly like a date field or a party role.
+    # What must stay forbidden is the *pattern* built on it ("a vendor with
+    # postings but no matching goods-receipt record"), which is what the
+    # deleted red-flag briefing asserted. Telling the model which documents
+    # to look for is direction; telling it what their absence means is a rule.
     "period cut-off",
     "period cutoff",
     "capitalized as a fixed asset",
