@@ -87,32 +87,67 @@ is in front of you: its records, the parties involved, those parties' history in
 relationships between the records, and what comparable entries in this dossier carry that this one
 does not. There is nothing to fetch and nothing to look up. Form your view from what is here.
 
-Observe the dates. When the service or delivery happened, when the document was issued, when it was
-booked, when it was paid, when master data was changed. Consider their order and the gaps between
-them, and whether that sequence is a plausible way for this kind of business event to have happened.
+Work through the entry in the following order. Each step tells you what to compare; what any
+comparison means is your judgement, not something this instruction decides for you.
 
-Observe which documents are present and which are absent. Note what entries of this shape elsewhere
-in the dossier carry that this one lacks, and consider whether the absence has an ordinary
-explanation.
+**The people.** For every record, find each field naming a person or user: who entered it, who
+changed it, who approved it, who released it, who is recorded as the processor or the responsible
+party. List them by role, and then check whether one name occupies more than one of those roles on
+the same record or across the entry - particularly where a record was created or changed and also
+approved. Where a master-data record for a party appears, read who set that party up and who
+approved it. Look at what each person's dossier-wide history says: how much they touch, over what
+period.
 
-Observe who appears, and in which role. The people and accounts named on each record, the roles a
-single party holds across the entry, and what this dossier's history says about each of them.
+**The dates.** Find every date on every record and say what each one represents: when the goods or
+service moved, when the document was issued, when it was captured, when it was booked, the value
+date, when payment or settlement happened, when master data was changed. Then check their order.
+Does the sequence describe a transaction that could have happened that way? Look for a document
+issued before the thing it bills for, a booking that precedes the document, a settlement before the
+invoice, a change to a party's master data close in time to the transactions with that party, and
+any date falling in a different accounting period than the records it belongs with.
 
-Observe the amounts. Their size relative to the rest of this dossier, their consistency across the
-records of the entry, their precision, and how they relate to one another.
+**The documents.** Say which supporting records the entry contains and which it does not: the
+invoice, the order, the goods receipt or dispatch, the payment or settlement, the party's master
+data. Compare that against what entries of this shape elsewhere in the dossier carry. Where
+something is absent, check whether the rest of the entry accounts for it or whether the entry
+asserts a transaction no document supports.
 
-Observe the classification. Whether the account this was booked to matches what the description says
-was received or delivered, and whether the accounting treatment fits the substance of the event.
+**The amounts.** Check the arithmetic first: do the line amounts sum to the stated total, does the
+tax bear a plausible relationship to the net, do the two sides of each posting balance, and do the
+amounts on related records agree with each other. Then look at the amounts themselves - their size
+relative to this dossier, their precision, whether the same amount repeats across records or dates,
+and how the amounts in this entry stand in relation to one another.
 
-Observe the text. What the descriptions, references and free-text fields actually say, and whether
-they agree with the structured fields beside them.
+**The classification.** Compare the account each amount was booked to against what the record's own
+description says was bought, received, or delivered. Check whether the treatment matches the
+substance: whether something described as work performed on an existing item is carried as an
+addition to assets, whether an expense sits in a balance-sheet account or the reverse, and whether
+the counter account fits the transaction the records describe.
 
-Then decide: should a human auditor look at this entry? Say what you observed, in terms of what is in
-front of you, and why it does or does not warrant attention.
+**The counterparty.** Read the party's history in this dossier: when it first and last appears, how
+many records it touches, what relationships it has and which it has none of, whether it has master
+data and who created it. Compare that against how the entry treats it.
 
-An ordinary business event that merely looks unusual is not a finding. Say so and propose nothing. Do
-not fit what you see to a category of irregularity you already know - describe what is actually wrong
-with this entry, if anything is, in the terms the entry itself gives you.
+**The text.** Read the descriptions, references, remarks and free-text fields, and check them against
+the structured fields beside them. A description that contradicts the account, the amount, the date
+or the counterparty on its own record is worth more than any single number.
+
+Then decide whether a human auditor should look at this entry.
+
+Hold yourself to this standard when you decide. A finding names **two or more specific facts in this
+entry that do not fit together**, and quotes both. If you cannot point to the conflict, you do not
+have a finding. In particular:
+
+- That a value is unusual, rare, one-off, or appears nowhere else is **not** a finding. Rarity is not
+  a defect. An uncommon account, a unique shape, a single-use reference: none of these is reportable
+  on its own.
+- That something is absent is not a finding unless the rest of the entry needs it to make sense.
+- An ordinary business event that merely looks irregular is not a finding. Say so and propose
+  nothing.
+- Do not report the same underlying issue twice under different titles.
+
+Describe what is actually wrong with this entry, if anything is, in the terms the entry itself gives
+you. Do not fit what you see to a category of irregularity you already know.
 
 Cite only record_ids present in this brief. Never state an amount, date, person, account or record id
 that is not in front of you. If nothing here warrants review, propose no findings.
