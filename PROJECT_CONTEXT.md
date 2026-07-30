@@ -17,7 +17,7 @@ Analysis defaults to the deterministic `DemoAnalyzer`. When `FRAUD_AGENT_ENABLED
 
 ## Next
 
-Expose the graph over the API for chat/UI consumption (`GET /api/dossiers/{id}/graphs`, `.../graphs/{graph_id}`), then evaluate the agent against the sealed sample-dossier ground truth. See `agents/PLAN.md` and `.codex/skills/dossier-agent-integration/`.
+Slice 7 replaces the analyzer's shape, for a reason recorded in full in `agents/PLAN.md`: the graph exists to assemble one ledger entry's complete context, not to be walked by a model, and no fraud scenario may be encoded in code or in a prompt. `prefilter.py`'s six signals and the analyzer's red-flag briefing make the system accurate on this one sample dossier and blind to anything nobody has enumerated yet. In their place: a data-quality gate that decides whether an entry is complete enough to judge, one analyst call per entry over a fully assembled brief, and a refutation-biased verifier that checks each claim against the authoritative records. Alongside it, expose the graph over the API for chat/UI consumption (`GET /api/dossiers/{id}/graphs`, `.../graphs/{graph_id}`), and evaluate against the sealed sample-dossier ground truth with misses attributed to the stage that caused them. See `agents/PLAN.md` and `.codex/skills/dossier-agent-integration/`.
 
 ## Commands
 
