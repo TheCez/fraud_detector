@@ -15,7 +15,9 @@ test_graph_engine.py:
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import time
 from pathlib import Path
 
@@ -315,34 +317,166 @@ def test_profile_determinism_holds_on_a_synthetic_dossier_too(completeness_dossi
 
 # ---------------------------------------------------------------------------
 # No encoded fraud scenario
+#
+# This used to be a denylist of the exact strings a deleted module
+# (app/analysis/prefilter.py) once encoded: _REPAIR_KEYWORDS naming German
+# repair-related words, _ROUND_THRESHOLDS naming round approval-limit-shaped
+# amounts, and _SIGNAL_* constants naming a specific fraud pattern. That
+# guards against the mistakes someone already made and removed - it does
+# nothing against a *new* mistake of the same shape. `_REPAIR_WORDS =
+# ("renovierung", "sanierung")` or a `2_500.0` threshold would pass a
+# denylist test clean while being exactly as much a fraud scenario as what
+# was removed.
+#
+# So this parses each module with `ast` and checks the *shape* a fraud
+# scenario always takes, rather than its specific past content:
+#
+#  1. no module-level constant whose name itself suggests domain judgement
+#     (KEYWORD/THRESHOLD/SIGNAL/PATTERN/SUSPICIOUS/FRAUD/RISK/EXPECTED/
+#     REQUIRED) rather than data format;
+#  2. no numeric literal at or above a modest bound, except the section-
+#     budget constants entry_brief.py is deliberately allowed to name (see
+#     that module's docstring on why those are exposed as constants);
+#  3. no new tuple/list/set literal of two or more constants of the same
+#     primitive kind (all strings, or all numbers) - a "list of words" is
+#     exactly the shape _REPAIR_WORDS took above, and it only takes two
+#     words to encode a vocabulary.
+#
+# An allowlist keyed by *value*, not name, holds every such collection that
+# exists today and is legitimate: the completeness dimensions, the document-
+# reference column names, the counterparty entity types, the master-data
+# record types, and the quantile points. The mechanism is deliberately an
+# allowlist rather than a memory of removed mistakes: the point is not to
+# remember _REPAIR_WORDS specifically, it is that *any* new collection of
+# this shape - named after the old mistake or not - fails until someone
+# deliberately adds its exact value here, which is the point where "is this
+# domain vocabulary?" has to be answered instead of slipped in silently.
+# `__all__` is exempted by name (not by value) since it is Python's own
+# export-list idiom, not domain vocabulary. Nothing else is exempted:
+# entry_brief.py used to carry a column-name glossary dict, which would have
+# been this test's one legitimate dict-shaped exception, but that glossary
+# was itself withdrawn (see the T5 review brief's superseding note on
+# Finding 2 - a large model already knows what a German GDPdU/GoBD column
+# name denotes, so an authored glossary was spending tokens teaching it
+# something it knows). With it gone, there is no authored domain vocabulary
+# of any kind left in either module - a stronger property than an
+# allowlisted exception for one.
 # ---------------------------------------------------------------------------
 
 _PROFILE_SOURCE = Path(__file__).resolve().parent.parent / "app" / "analysis" / "profile.py"
 _ENTRY_BRIEF_SOURCE = Path(__file__).resolve().parent.parent / "app" / "analysis" / "entry_brief.py"
 
-# The exact shape of thing this module must never contain - see
-# app/analysis/prefilter.py's _REPAIR_KEYWORDS, _ROUND_THRESHOLDS and
-# _SIGNAL_* constants for what a reintroduced fraud scenario would look like:
-# a German keyword list naming a specific fraud pattern, or a tuple of round
-# approval-limit-shaped amount thresholds.
-_FORBIDDEN_FRAUD_KEYWORDS = (
-    "reparatur",
-    "instandsetzung",
-    "generalüberholung",
-    "generaluberholung",
-    "wartung",
-    "austausch",
+_FORBIDDEN_NAME_PATTERN = re.compile(
+    r"KEYWORD|THRESHOLD|SIGNAL|PATTERN|SUSPICIOUS|FRAUD|RISK|EXPECTED|REQUIRED", re.IGNORECASE
 )
-_FORBIDDEN_THRESHOLD_LITERALS = ("1_000.0", "5_000.0", "10_000.0", "25_000.0", "50_000.0", "100_000.0")
-_FORBIDDEN_NAMED_SIGNALS = ("_SIGNAL_MISSING_RECEIPT", "_SIGNAL_SELF_APPROVAL", "_ROUND_THRESHOLD")
+
+# entry_brief.py's per-section character budgets - named module constants by
+# design (see that module's docstring), not domain vocabulary.
+_ALLOWED_LARGE_NUMERIC_CONSTANT_NAMES = {
+    "ENTRY_SECTION_BUDGET",
+    "TIMELINE_SECTION_BUDGET",
+    "RECORDS_SECTION_BUDGET",
+    "PARTIES_SECTION_BUDGET",
+    "RELATIONSHIPS_SECTION_BUDGET",
+    "NOT_PRESENT_SECTION_BUDGET",
+    "CONVENTIONS_SECTION_BUDGET",
+    "SUMMARY_BUDGET",
+}
+
+# A numeric literal at or above this is treated as potentially threshold-
+# shaped. Comfortably above every legitimate small literal these two modules
+# use today (list indices, the quantile points, the x100 in percentile
+# formatting) and comfortably below the smallest section budget (500).
+_MODEST_NUMERIC_BOUND = 200
+
+# The exact value of every constant collection that exists in these two
+# modules today and is legitimate - see the block comment above.
+_ALLOWED_CONSTANT_COLLECTIONS = {
+    ("date", "amount", "counterparty", "document_reference"),  # COMPLETENESS_DIMENSIONS
+    ("BELEGNUMMER", "BUCHUNGSNUMMER", "DOKUMENT", "RECHNUNGSNUMMER"),  # _DOCUMENT_REFERENCE_FIELDS
+    ("vendor", "customer"),  # _COUNTERPARTY_ENTITY_TYPES
+    ("master_data", "master_change"),  # _MASTER_DATA_RECORD_TYPES
+    (0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0),  # _QUANTILE_POINTS
+}
+
+
+def _check_module_for_fraud_scenario_shape(source_path: Path) -> list[str]:
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    violations: list[str] = []
+
+    # Rule 1: module-level constant names suggesting domain judgement.
+    for stmt in ast.iter_child_nodes(tree):
+        target_name = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target_name = stmt.targets[0].id
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            target_name = stmt.target.id
+        if target_name and _FORBIDDEN_NAME_PATTERN.search(target_name):
+            violations.append(f"module-level constant {target_name!r} has a domain-judgement-shaped name")
+
+    # Nodes that belong to an allowed large-numeric-constant's own value
+    # subtree are exempt from rule 2.
+    exempt_numeric_node_ids: set[int] = set()
+    for stmt in ast.iter_child_nodes(tree):
+        name = None
+        value = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            name, value = stmt.targets[0].id, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            name, value = stmt.target.id, stmt.value
+        if name in _ALLOWED_LARGE_NUMERIC_CONSTANT_NAMES:
+            exempt_numeric_node_ids.update(id(node) for node in ast.walk(value))
+
+    # Rule 2: no numeric literal at/above the modest bound outside an
+    # allowed named budget constant.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            if id(node) in exempt_numeric_node_ids:
+                continue
+            if abs(node.value) >= _MODEST_NUMERIC_BOUND:
+                violations.append(
+                    f"numeric literal {node.value!r} is at/above the modest bound "
+                    f"({_MODEST_NUMERIC_BOUND}) outside an allowed budget constant"
+                )
+
+    # Rule 3: no new module-level constant bound to a tuple/list/set literal
+    # of 2+ same-kind constants. Scoped to module-level assignments only
+    # (not any collection literal anywhere, e.g. inside a function body) -
+    # genuine domain vocabulary is always given a reusable name, which is
+    # exactly what every historical example (_REPAIR_WORDS, and this file's
+    # own allowlisted collections below) does; sweeping in every anonymous
+    # literal also catches ordinary structural code - a two-element counter
+    # pair like ``[0, 0]``, or a function's own list of output lines - which
+    # would make the rule too noisy to keep.
+    for stmt in ast.iter_child_nodes(tree):
+        target_name, value = None, None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target_name, value = stmt.targets[0].id, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            target_name, value = stmt.target.id, stmt.value
+        if value is None or not isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            continue
+        elts = value.elts
+        if len(elts) < 2 or not all(isinstance(elt, ast.Constant) for elt in elts):
+            continue
+        values = [elt.value for elt in elts]
+        is_all_str = all(isinstance(v, str) for v in values)
+        is_all_number = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values)
+        if not (is_all_str or is_all_number):
+            continue
+        if target_name == "__all__":
+            continue
+        if tuple(values) in _ALLOWED_CONSTANT_COLLECTIONS:
+            continue
+        violations.append(
+            f"module-level constant {target_name!r} is a new "
+            f"{type(value).__name__.lower()} literal {tuple(values)!r} with a domain-vocabulary shape"
+        )
+
+    return violations
 
 
 @pytest.mark.parametrize("source_path", [_PROFILE_SOURCE, _ENTRY_BRIEF_SOURCE])
 def test_no_encoded_fraud_scenario(source_path: Path):
-    text = source_path.read_text(encoding="utf-8").lower()
-    for keyword in _FORBIDDEN_FRAUD_KEYWORDS:
-        assert keyword not in text, f"{source_path.name} contains fraud-domain keyword {keyword!r}"
-    for literal in _FORBIDDEN_THRESHOLD_LITERALS:
-        assert literal.lower() not in text, f"{source_path.name} contains an approval-threshold-shaped literal {literal!r}"
-    for signal_name in _FORBIDDEN_NAMED_SIGNALS:
-        assert signal_name.lower() not in text, f"{source_path.name} contains a named fraud signal constant {signal_name!r}"
+    violations = _check_module_for_fraud_scenario_shape(source_path)
+    assert not violations, f"{source_path.name} has fraud-scenario-shaped code:\n" + "\n".join(violations)

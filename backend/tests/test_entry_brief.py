@@ -38,6 +38,23 @@ def largest_entry_graph_id(sample_process_graphs) -> str:
     return max(sample_process_graphs, key=lambda pg: (pg.record_count, pg.graph_id)).graph_id
 
 
+@pytest.fixture(scope="session")
+def broad_sample_process_graphs(sample_process_graphs):
+    """At least ~50 real entries spanning the dossier's size range (by record
+    count), including the smallest and the largest - see the T5 review
+    brief's Finding 1: the median real entry was the one that first exposed
+    truncation, so a sample must cover the middle of the range, not just the
+    extremes."""
+    ordered = sorted(sample_process_graphs, key=lambda pg: (pg.record_count, pg.graph_id))
+    stride = max(1, len(ordered) // 60)
+    sample = list(ordered[::stride])
+    for edge_case in (ordered[0], ordered[-1]):
+        if edge_case not in sample:
+            sample.append(edge_case)
+    assert len(sample) >= 50, f"broad sample only has {len(sample)} entries, want at least 50"
+    return sample
+
+
 @requires_sample_zip
 def test_full_brief_for_the_largest_real_entry_stays_under_6k_tokens(
     sample_saved_db_path: Path, sample_graph, sample_process_graphs, sample_profile, largest_entry_graph_id: str
@@ -128,6 +145,44 @@ def test_truncation_marker_appears_when_a_section_budget_is_exceeded(
     assert "60-char budget" in brief
 
 
+@requires_sample_zip
+def test_no_real_entry_in_the_sample_dossier_is_truncated_or_incomplete(
+    sample_saved_db_path: Path, sample_graph, sample_process_graphs, sample_profile, broad_sample_process_graphs
+):
+    """The invariant Finding 1 of the T5 review brief establishes: every real
+    entry's brief carries its own complete graph - every one of its
+    record_ids and entity_node_ids appears in the rendered text, and nothing
+    was cut. Truncation stays in the code as a safety valve for a
+    pathological entry (see test_truncation_marker_appears_when_a_section_
+    budget_is_exceeded above), but no *real* entry in this dossier may ever
+    reach it - a truncated brief silently withholds part of the one ledger
+    entry the analyst model is supposed to read in full."""
+    incomplete: list[str] = []
+    for process_graph in broad_sample_process_graphs:
+        brief = render_entry_brief(
+            DOSSIER_ID,
+            sample_saved_db_path,
+            process_graph.graph_id,
+            sample_profile,
+            graph=sample_graph,
+            process_graphs=sample_process_graphs,
+        )
+        if "[TRUNCATED:" in brief:
+            incomplete.append(f"{process_graph.graph_id}: truncated")
+            continue
+        for record_id in process_graph.record_ids:
+            if record_id not in brief:
+                incomplete.append(f"{process_graph.graph_id}: missing record_id {record_id}")
+        for entity_node_id in process_graph.entity_node_ids:
+            if entity_node_id not in brief:
+                incomplete.append(f"{process_graph.graph_id}: missing entity_node_id {entity_node_id}")
+
+    assert not incomplete, (
+        f"{len(incomplete)} incompleteness finding(s) across "
+        f"{len(broad_sample_process_graphs)} sampled real entries:\n" + "\n".join(incomplete[:20])
+    )
+
+
 # ---------------------------------------------------------------------------
 # Synthetic dossiers
 # ---------------------------------------------------------------------------
@@ -189,8 +244,8 @@ def test_timeline_only_lists_dates_actually_present_on_a_record(tmp_path: Path):
 
     brief = render_entry_brief(dossier_id, db_path, graph_id, profile, graph=graph, process_graphs=process_graphs)
 
-    assert "2024-06-14  BELEGDATUM (document date)  T1 vendor_posting" in brief
-    assert "2024-06-15  BUCHUNGSDATUM (posting date)  T1 vendor_posting" in brief
+    assert "2024-06-14  BELEGDATUM  T1 vendor_posting" in brief
+    assert "2024-06-15  BUCHUNGSDATUM  T1 vendor_posting" in brief
 
 
 def test_not_present_reports_missing_identity_dimensions_with_peer_counts(completeness_dossier):

@@ -98,7 +98,13 @@ class EntityProfile:
     mean_amount: float | None
     edge_type_counts: dict[str, int]
     master_data_reference_count: int
-    counterparty_count: int
+    # Every other entity node (account, user, asset, vendor, customer - any
+    # entity type) this entity co-occurs on at least one shared record with.
+    # Not the same thing as a vendor/customer "counterparty" (see
+    # _COUNTERPARTY_ENTITY_TYPES / COMPLETENESS_DIMENSIONS' "counterparty"
+    # dimension above) - this counts every co-occurring entity node, internal
+    # references included.
+    co_occurring_entity_count: int
 
 
 @dataclass
@@ -181,10 +187,27 @@ def build_profile(
     record_meta: dict[str, tuple[str, str | None, float | None]] = {}
     record_counterparty_types: dict[str, frozenset[str]] = {}
     record_has_document_ref: dict[str, bool] = {}
-    record_data: dict[str, dict[str, Any]] = {}
     amounts: list[float] = []
     periods: set[str] = set()
     record_count = 0
+
+    # Record -> owning process graph. Built before pass 1 (it needs only the
+    # already-loaded process_graphs, nothing pass 1 discovers) so pass 1 can
+    # accumulate each entry's field-fill-rate counters as records stream,
+    # instead of retaining every one of the dossier's ~32.8k records' full
+    # field dict for the whole build just to compute this afterward. Every
+    # record node belongs to exactly one process graph - subgraphs.py's
+    # join_graph adds every record node even when it joins to nothing, so
+    # this mapping is total.
+    record_to_graph: dict[str, str] = {}
+    for process_graph in process_graphs:
+        for rid in process_graph.record_ids:
+            record_to_graph[rid] = process_graph.graph_id
+
+    # graph_id -> column -> [filled_count, applicable_count]. Accumulated in
+    # place as pass 1 streams so no record's field dict outlives its own
+    # iteration.
+    entry_field_counts: dict[str, dict[str, list[int]]] = {}
 
     # --- Pass 1: one streamed read of every normalized record. ---
     for row in iter_records_by_dossier(db_path, dossier_id):
@@ -202,7 +225,6 @@ def build_profile(
             periods.add(period)
 
         data = parsed.get("data") or {}
-        record_data[record_id] = data
         entities = parsed.get("entities") or []
         record_counterparty_types[record_id] = frozenset(
             entity_type
@@ -213,22 +235,27 @@ def build_profile(
             _non_empty(_get_ci(data, field_name)) for field_name in _DOCUMENT_REFERENCE_FIELDS
         )
 
+        gid = record_to_graph.get(record_id)
+        if gid is not None:
+            column_counts = entry_field_counts.setdefault(gid, {})
+            for column, value in data.items():
+                counter = column_counts.setdefault(column, [0, 0])
+                counter[1] += 1
+                if _non_empty(value):
+                    counter[0] += 1
+
     amounts.sort()
     amount_quantiles = _quantiles(amounts)
 
-    # Record -> owning process graph, and each process graph's shape (the
-    # sorted tuple of its member records' types). Every record node belongs to
-    # exactly one process graph - subgraphs.py's join_graph adds every record
-    # node even when it joins to nothing, so this mapping is total.
+    # Each process graph's shape (the sorted tuple of its member records'
+    # types) - needs record_meta, which pass 1 just populated, so this stays
+    # after it.
     graph_shape: dict[str, tuple[str, ...]] = {}
-    record_to_graph: dict[str, str] = {}
     for process_graph in process_graphs:
         shape = tuple(
             sorted(record_meta[rid][0] for rid in process_graph.record_ids if rid in record_meta)
         )
         graph_shape[process_graph.graph_id] = shape
-        for rid in process_graph.record_ids:
-            record_to_graph[rid] = process_graph.graph_id
 
     # --- Pass 2: one walk of every edge in the built graph. ---
     entity_record_ids: dict[str, set[str]] = {}
@@ -287,7 +314,7 @@ def build_profile(
             mean_amount=(sum(entity_amounts) / len(entity_amounts)) if entity_amounts else None,
             edge_type_counts=full_counts,
             master_data_reference_count=master_count,
-            counterparty_count=len(counterparties),
+            co_occurring_entity_count=len(counterparties),
         )
 
     # --- Per-entry completeness: aggregate across each entry's own records. ---
@@ -302,15 +329,11 @@ def build_profile(
         counterparty_record_ids = tuple(rid for rid in record_ids if record_counterparty_types.get(rid))
         document_reference_record_ids = tuple(rid for rid in record_ids if record_has_document_ref.get(rid))
 
-        field_columns: set[str] = set()
-        for rid in record_ids:
-            field_columns.update(record_data.get(rid, {}).keys())
-
-        field_fill_rates: dict[str, tuple[int, int]] = {}
-        for column in sorted(field_columns):
-            applicable = [rid for rid in record_ids if column in record_data.get(rid, {})]
-            filled = [rid for rid in applicable if _non_empty(record_data[rid][column])]
-            field_fill_rates[column] = (len(filled), len(applicable))
+        column_counts = entry_field_counts.get(process_graph.graph_id, {})
+        field_fill_rates: dict[str, tuple[int, int]] = {
+            column: (filled, applicable)
+            for column, (filled, applicable) in sorted(column_counts.items())
+        }
 
         entry_completeness[process_graph.graph_id] = EntryCompleteness(
             graph_id=process_graph.graph_id,

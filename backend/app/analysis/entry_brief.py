@@ -54,39 +54,9 @@ from app.graph.subgraphs import ProcessGraph
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# Data-format facts only - what a column *is*, never what a value would
-# imply. See the module docstring on the data-quality-vs-fraud-judgement line.
-_COLUMN_GLOSSARY: dict[str, str] = {
-    "BUCHUNGSBETRAG": "posting amount",
-    "BUCHUNGSDATUM": "posting date",
-    "BUCHUNGSWAEHRUNG": "posting currency",
-    "BUCHUNGSTEXT": "posting text",
-    "BUCHUNGSNUMMER": "posting/document number",
-    "BELEGDATUM": "document date",
-    "BELEGNUMMER": "document number",
-    "ERFASSUNGSDATUM": "entry-capture date",
-    "WERTSTELLUNG": "value date",
-    "LETZTER_AUSGLEICH": "last-settlement date",
-    "PERIODENCODE": "accounting period code",
-    "SACHKONTONUMMER": "GL account number",
-    "GEGENKONTO": "counter account",
-    "KONTO": "account number",
-    "ANLAGENGRUPPE": "asset GL capitalization account",
-    "ANLAGENNUMMER": "asset number",
-    "ANLAGENBEZEICHNUNG": "asset description",
-    "LIEFERANTENKONTONUMMER": "vendor account number",
-    "KUNDENKONTONUMMER": "customer account number",
-    "KREDITOR": "vendor",
-    "DEBITOR": "customer",
-    "RECHNUNGSNUMMER": "invoice number",
-    "DOKUMENT": "document identifier",
-    "GEAENDERT_VON": "changed by",
-    "GENEHMIGT_VON": "approved by",
-    "ERSTELLT_VON": "created by",
-    "BEARBEITER": "processed by",
-    "BENUTZERKENNUNG": "user ID",
-    "ERFASSER": "entered by",
-}
+# The record-node id prefix, derived from the real schema function rather
+# than duplicated as a literal - see _endpoint_record_id below.
+_RECORD_NODE_PREFIX = record_node_id("")
 
 _IDENTITY_DIMENSION_LABELS: dict[str, str] = {
     "date": "a date",
@@ -99,22 +69,34 @@ _IDENTITY_DIMENSION_LABELS: dict[str, str] = {
 # as module constants (rather than inlined) so a test can drive one down and
 # assert the truncation marker fires - see test_entry_brief.py.
 #
-# Chosen so their SUM stays at 21,000 chars (~5,250 tokens at the ~4
-# chars/token approximation this module documents and tests against) - safely
-# under the ~6k-token target for *any* entry, not merely today's largest real
-# one (measured at ~4,070 tokens after these caps, ~6,285 uncapped). Records
-# and Timeline get the most headroom since they carry the entry's own unique
-# facts; Parties and Relationships absorb most of the squeeze, since a busy
-# entity's dossier-wide profile and the entry's internal edge list are the
-# most repetitive sections relative to their size - see the task brief's
-# "trap" about entity connectivity being expensive to enumerate in full.
-ENTRY_SECTION_BUDGET = 500
-TIMELINE_SECTION_BUDGET = 3200
-RECORDS_SECTION_BUDGET = 9200
-PARTIES_SECTION_BUDGET = 4200
-RELATIONSHIPS_SECTION_BUDGET = 2400
-NOT_PRESENT_SECTION_BUDGET = 600
-CONVENTIONS_SECTION_BUDGET = 900
+# Each budget is set with headroom over the real worst case measured across
+# every entry in the sample dossier (4,902 process graphs), not fitted to
+# today's numbers exactly - measured maxima: Entry 485, Timeline 2,492,
+# Records 8,563, Parties 6,672, Relationships 4,614, Not-present 525,
+# Conventions 272 chars. None of these budgets pads a smaller entry's
+# output - a section only ever costs what its own real content needs - so
+# their sum (~31,100 chars, a safety-valve ceiling, not a target) is not the
+# same thing as any real entry's actual size. The real worst entry in the
+# dossier (12 records, 8 parties) renders at ~21,700 chars (~5,425 tokens at
+# the ~4 chars/token approximation this module documents and tests against),
+# comfortably under the ~6k-token target - see
+# test_full_brief_for_the_largest_real_entry_stays_under_6k_tokens and
+# test_no_real_entry_in_the_sample_dossier_is_truncated_or_incomplete.
+# Parties and Relationships carry the most headroom above their measured max
+# because a busy entity's dossier-wide profile and the entry's internal edge
+# list are the sections most likely to grow on a dossier with busier hubs
+# than this sample one - see the task brief's "trap" about entity
+# connectivity being expensive to enumerate in full. Conventions needs
+# almost no headroom: since the column glossary was withdrawn (see
+# _render_conventions_section's docstring), its content is two fixed
+# sentences that do not vary by entry at all.
+ENTRY_SECTION_BUDGET = 800
+TIMELINE_SECTION_BUDGET = 3500
+RECORDS_SECTION_BUDGET = 11000
+PARTIES_SECTION_BUDGET = 8500
+RELATIONSHIPS_SECTION_BUDGET = 6000
+NOT_PRESENT_SECTION_BUDGET = 900
+CONVENTIONS_SECTION_BUDGET = 400
 
 # Overall budget for the compact summary - about 400 tokens at the ~4
 # chars/token approximation this module documents and tests against.
@@ -140,6 +122,24 @@ def _fmt_amount(amount: float | None) -> str:
     if amount is None:
         return "n/a"
     return f"{amount:.2f}"
+
+
+_EMPTY_FIELD_MARKER = "(empty)"
+
+
+def _render_field_value(value: Any) -> str:
+    """Render one record field's raw value for the Records section.
+
+    ``None`` (an absent field, from the parsers) renders as the marker
+    ``(empty)`` rather than Python's ``str(None)`` == "None", which would
+    read as if the field's real value were the four-letter word "None". A
+    real field value that happens to equal the marker text itself is quoted
+    instead, so that one case can never be mistaken for the marker."""
+    if value is None:
+        return _EMPTY_FIELD_MARKER
+    if value == _EMPTY_FIELD_MARKER:
+        return f'"{value}"'
+    return str(value)
 
 
 @dataclass
@@ -229,15 +229,29 @@ def _render_entry_section(profile: DossierProfile, context: _EntryContext) -> st
     record_types = sorted({record["record_type"] for record in context.records})
     dates = sorted(record["date"] for record in context.records if record.get("date"))
 
-    totals: dict[str, float] = {}
+    # Subtotalled by record type, not just currency/sign: an invoice and the
+    # journal postings it generated both carry the same money, so summing
+    # every record in the entry into one figure counts that money twice - no
+    # reading of the resulting number is meaningful, yet a model handed a
+    # line labelled "Totals" will reason about it anyway. Each subtotal below
+    # sums only records of one homogeneous type, so every figure describes
+    # one real quantity.
+    subtotals: dict[tuple[str, str, str], float] = {}
     for record in context.records:
-        currency = record.get("currency") or "unknown"
         amount = record.get("amount")
         if amount is None:
             continue
+        currency = record.get("currency") or "unknown"
         sign = "positive" if amount >= 0 else "negative"
-        key = f"{currency} {sign}"
-        totals[key] = totals.get(key, 0.0) + amount
+        key = (record["record_type"], currency, sign)
+        subtotals[key] = subtotals.get(key, 0.0) + amount
+    subtotal_text = (
+        ", ".join(
+            f"{record_type} {currency} {sign}={_fmt_amount(value)}"
+            for (record_type, currency, sign), value in sorted(subtotals.items())
+        )
+        or "none"
+    )
 
     shape_profile = _shape_profile(profile, pg.graph_id)
     shape_count = shape_profile.entry_count if shape_profile else 0
@@ -245,7 +259,7 @@ def _render_entry_section(profile: DossierProfile, context: _EntryContext) -> st
     lines = [
         f"Entry {pg.graph_id}",
         f"Record types: {', '.join(record_types) if record_types else 'none'}",
-        f"Totals: " + (", ".join(f"{key}={_fmt_amount(value)}" for key, value in sorted(totals.items())) or "none"),
+        f"Subtotals by record type: {subtotal_text}",
         f"Date span: {dates[0] if dates else 'n/a'} to {dates[-1] if dates else 'n/a'}",
         f"Shape frequency: this combination of record types occurs {shape_count} "
         f"times of {profile.total_entries} entries in the dossier",
@@ -264,9 +278,7 @@ def _render_timeline_section(context: _EntryContext) -> str:
 
     lines = ["Timeline"]
     for date, column, record_id, record_type in entries:
-        description = _COLUMN_GLOSSARY.get(column.upper())
-        label = f"{column} ({description})" if description else column
-        lines.append(f"{date}  {label}  {record_id} {record_type}")
+        lines.append(f"{date}  {column}  {record_id} {record_type}")
     if len(entries) == 0:
         lines.append("No dated fields found on any record in this entry.")
     return _apply_budget("\n".join(lines), TIMELINE_SECTION_BUDGET)
@@ -293,26 +305,38 @@ def _render_records_section(context: _EntryContext) -> str:
         lines.append(f"  Source: {', '.join(location_bits)}")
         data = record.get("data") or {}
         for column in sorted(data):
-            lines.append(f"  {column}: {data[column]}")
+            lines.append(f"  {column}: {_render_field_value(data[column])}")
         if record.get("text_content"):
             lines.append(f"  text_content: {record['text_content']}")
     return _apply_budget("\n".join(lines), RECORDS_SECTION_BUDGET)
+
+
+def _render_edge_counts(edge_type_counts: dict[str, int]) -> str:
+    """Render every edge type's count compactly: the non-zero ones spelled
+    out, the zero ones named once as a single list rather than repeated as
+    ``type=0`` - a zero count is still a measured fact worth keeping (e.g.
+    "this vendor has 0 has_receipt edges"), it just does not need its own
+    "=0" for each of the ~14 edge types that do not apply."""
+    edge_items = sorted(edge_type_counts.items())
+    present = [f"{edge_type}={count}" for edge_type, count in edge_items if count > 0]
+    absent = [edge_type for edge_type, count in edge_items if count == 0]
+    line = ", ".join(present) if present else "none"
+    if absent:
+        line += " | none: " + ", ".join(absent)
+    return line
 
 
 def _entity_profile_line(profile: DossierProfile, entity_node_id: str) -> str:
     entity_profile = profile.entities.get(entity_node_id)
     if entity_profile is None:
         return f"  Dossier-wide profile: no profile computed for {entity_node_id}"
-    nonzero_edges = ", ".join(
-        f"{edge_type}={count}" for edge_type, count in sorted(entity_profile.edge_type_counts.items())
-    )
     return (
         f"  Dossier-wide: {entity_profile.record_count} record(s), "
         f"{entity_profile.first_date or 'n/a'} to {entity_profile.last_date or 'n/a'}, "
         f"total {_fmt_amount(entity_profile.total_amount)} (mean {_fmt_amount(entity_profile.mean_amount)}), "
         f"master-data references: {entity_profile.master_data_reference_count}, "
-        f"distinct counterparties: {entity_profile.counterparty_count}\n"
-        f"  Edge counts: {nonzero_edges}"
+        f"co-occurring entities: {entity_profile.co_occurring_entity_count}\n"
+        f"  Edges: {_render_edge_counts(entity_profile.edge_type_counts)}"
     )
 
 
@@ -331,6 +355,13 @@ def _render_parties_section(profile: DossierProfile, context: _EntryContext) -> 
     return _apply_budget("\n".join(lines), PARTIES_SECTION_BUDGET)
 
 
+def _endpoint_record_id(node_id: str) -> str | None:
+    """The bare record id if ``node_id`` is a record node, else ``None``."""
+    if node_id.startswith(_RECORD_NODE_PREFIX):
+        return node_id[len(_RECORD_NODE_PREFIX) :]
+    return None
+
+
 def _render_relationships_section(context: _EntryContext) -> str:
     lines = ["Relationships"]
     ordered_edges = sorted(
@@ -339,8 +370,22 @@ def _render_relationships_section(context: _EntryContext) -> str:
     )
     for source, dst, data in ordered_edges:
         edge_type = data.get("edge_type", "")
-        record_ids = ", ".join(data.get("record_ids", ()))
-        lines.append(f"{source} -[{edge_type}]-> {dst} (record_ids: {record_ids})")
+        edge_record_ids = set(data.get("record_ids") or ())
+        endpoint_record_ids = {
+            rid for rid in (_endpoint_record_id(source), _endpoint_record_id(dst)) if rid is not None
+        }
+        # Only print the justifying record_ids when they carry a record
+        # beyond the edge's own two endpoints - when the set is exactly
+        # {source, dst}, both 36-char UUIDs are already on the line and
+        # repeating them adds nothing. Do NOT simplify this to unconditional:
+        # an edge between two entity nodes (no record endpoint at all) or a
+        # document_join edge justified by a third record both need the
+        # explicit list to stay traceable.
+        if edge_record_ids and edge_record_ids != endpoint_record_ids:
+            record_ids_text = ", ".join(sorted(edge_record_ids))
+            lines.append(f"{source} -[{edge_type}]-> {dst} (record_ids: {record_ids_text})")
+        else:
+            lines.append(f"{source} -[{edge_type}]-> {dst}")
     if len(ordered_edges) == 0:
         lines.append("No internal relationships between this entry's own nodes.")
     return _apply_budget("\n".join(lines), RELATIONSHIPS_SECTION_BUDGET)
@@ -408,6 +453,14 @@ def _render_not_present_section(profile: DossierProfile, graph_id: str) -> str:
 
 
 def _render_conventions_section(context: _EntryContext) -> str:
+    """States what was done to values between the source file and this brief
+    - the two facts the model cannot know by inspection and that matter when
+    it quotes an amount or a date back. Column names render verbatim as the
+    export spells them elsewhere in the brief: a large model already knows
+    what a German GDPdU/GoBD column name like FAKTURADATUM or LEISTUNGSDATUM
+    denotes without being told, so an authored glossary would spend tokens
+    teaching it something it knows, on every one of this dossier's 4,902
+    briefs - see the T5 review brief's superseding note on Finding 2."""
     lines = [
         "Conventions",
         'Amounts on source documents use comma decimals (e.g. "9.780,00" is nine '
@@ -416,17 +469,6 @@ def _render_conventions_section(context: _EntryContext) -> str:
         "Dates on source documents are DD.MM.YYYY and are already normalized to ISO "
         "8601 (YYYY-MM-DD) above.",
     ]
-    columns_present: set[str] = set()
-    for record in context.records:
-        columns_present.update((record.get("data") or {}).keys())
-    glossary_lines = [
-        f"{column}: {_COLUMN_GLOSSARY[column.upper()]}"
-        for column in sorted(columns_present)
-        if column.upper() in _COLUMN_GLOSSARY
-    ]
-    if glossary_lines:
-        lines.append("Column glossary:")
-        lines.extend(f"  {line}" for line in glossary_lines)
     return _apply_budget("\n".join(lines), CONVENTIONS_SECTION_BUDGET)
 
 
@@ -491,7 +533,7 @@ def _summary_party_lines(profile: DossierProfile, context: _EntryContext) -> lis
             continue
         lines.append(
             f"{entity_node_id}: {role_text}; {entity_profile.record_count} record(s) dossier-wide, "
-            f"counterparties={entity_profile.counterparty_count}"
+            f"co-occurring entities={entity_profile.co_occurring_entity_count}"
         )
     return lines
 
