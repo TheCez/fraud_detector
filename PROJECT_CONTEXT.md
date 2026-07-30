@@ -1,33 +1,53 @@
-﻿# Project Context
+# Project Context
 
 ## Current state
 
-Slices 1-6 are implemented. The application safely processes one ZIP dossier end to end: inventory, normalization, SQLite persistence, a local graph engine, evidence-backed findings, source previews, and background analysis.
+The application processes one ZIP dossier end to end: inventory, normalization, SQLite persistence, a local graph, evidence-backed findings, source previews, and background analysis.
 
-Whenever normalization produces records - regardless of analyzer mode - `runner.py` builds a `networkx.MultiDiGraph` from them (`app/graph/builder.py`), enumerates per-transaction process graphs (`app/graph/subgraphs.py`), and persists both to SQLite (`app/graph/store.py`). This backs both today's agent analyzer and the upcoming graph-rendering UI and chat agent.
+`runner.py` builds a `networkx.MultiDiGraph` from the normalized records (`app/graph/builder.py`), enumerates per-transaction **process graphs** (`app/graph/subgraphs.py`), and persists both (`app/graph/store.py`) whenever normalization produced records - regardless of analyzer mode.
 
-Analysis defaults to the deterministic `DemoAnalyzer`. When `FRAUD_AGENT_ENABLED` is enabled and `OPENAI_API_KEY` is configured, it instead runs `GraphAnalyzer`: a cheap, deterministic, recall-oriented pre-filter (`app/analysis/prefilter.py`) selects which process graphs are worth a model call - the graph engine can produce thousands per dossier, so calling the model on every one is the same cost wall that killed the previous Cognee integration - and bounded LangGraph agents walk the selected graphs concurrently via the typed tool API in `app/graph/tools.py`, under a hard per-graph step budget, a hard per-run model-call cap (`AgentSettings.model_call_cap`), and a bounded worker pool (`AgentSettings.max_workers`). Candidates are ranked by signal specificity so the cap truncates the weakest rather than an arbitrary slice, and findings are sorted deterministically so traversal order never leaks into the result. Agent proposals are rehydrated from dossier-scoped SQLite records via `app/evidence/store.py`'s `EvidenceRecordStore` before findings are persisted, so model-provided evidence text is never trusted and a proposal citing any unresolvable record id is discarded whole. Enabling the agent without a configured `OPENAI_API_KEY` raises `GraphUnavailableError` rather than silently falling back to the demo analyzer. Model or graph-build failures leave the dossier in the explicit `analysis_incomplete` state instead of presenting a false report; analysis can be retried through `POST /api/dossiers/{dossier_id}/analysis`. Hitting the model-call cap does not fail the run, but is logged and recorded on the analysis run rather than silently presenting a partial result as complete.
+Analysis defaults to the deterministic `DemoAnalyzer`. With `FRAUD_AGENT_ENABLED=true` and an `OPENAI_API_KEY`, `app/analysis/pipeline.py`'s `AnalysisPipeline` runs instead:
+
+1. `app/analysis/profile.py` computes a `DossierProfile` in one pass over records and one over edges - per-entity counts (including a zero count per edge type), per-shape statistics, per-entry completeness facts, dossier-wide amount quantiles.
+2. `app/analysis/entry_brief.py` renders one process graph as a bounded **text** brief: the entry, a chronological timeline, every record with its fields and provenance, the parties with their dossier-wide profiles and their own master-data records, the relationships, and what peer entries of the same shape carry that this one lacks.
+3. `app/analysis/analyst.py` makes **exactly one** structured-output model call per entry over that brief. No tools are bound; there is no traversal and no step budget.
+4. Proposals are rehydrated through `app/evidence/store.py` before becoming findings.
+
+One process graph is one ledger entry - median 8 records on the sample dossier. The graph exists to assemble that entry's full context *before* the model is called, not to be walked by it. No fraud scenario is encoded anywhere in code or in a prompt; the prompts live in `agents/PROMPTS.md` and a test guard enforces this.
+
+Entry order for the per-run model-call cap comes from `pipeline.rank_entries_for_analysis` (amount percentile, shape rarity, absence count). It orders and never excludes. A cap hit is recorded on the analysis run with achieved coverage.
+
+Enabling the agent without credentials raises `GraphUnavailableError`. Model or graph-build failures leave the dossier in `analysis_incomplete` rather than presenting a false report; retry via `POST /api/dossiers/{dossier_id}/analysis`.
 
 ## Stable seams
 
-- `backend/app/analysis/interface.py` defines the analyzer contract.
-- `backend/app/graph/tools.py` is the bounded, dossier-scoped, typed query API shared by the fraud-analysis agent and a future findings chat agent - the only sanctioned way to read the graph.
+- `backend/app/analysis/interface.py` - the analyzer contract. `AnalysisPipeline` implements it.
+- `backend/app/graph/tools.py` - the bounded, dossier-scoped, typed query API. The analyzer no longer uses it; it remains the sanctioned read path for the coming graph endpoints and a future chat agent.
+- `backend/app/evidence/store.py` - the authoritative evidence store every analyzer rehydrates from.
 - Normalized records retain stable IDs and source provenance.
-- `backend/app/evidence/store.py`'s `EvidenceRecordStore` is the authoritative local evidence store every analyzer rehydrates findings from.
+
+## Measured, on the real sample dossier
+
+32,821 records -> 41,997 nodes, ~110k edges, 4,902 process graphs (median 8 records, max 12).
+
+| | |
+|---|---|
+| archive to findings, deterministic path | ~23s (normalize 6.6s, graph build and persist 12.0s) |
+| profile build | ~4s |
+| one entry brief | ~7ms, median ~14.6k chars (~3.7k tokens), max ~21k |
+| one call per entry, whole dossier | ~15M input tokens |
+| full backend suite | ~6 min, 172 tests |
+
+Live analyst accuracy against the sealed ground truth (`gpt-5.4`, 77 cases x 3 runs - see the `live-eval` skill): repair capitalization and the period cut-off are found for the right reasons. Ordinary control entries are flagged 8% of the time and decoys 48%. Precision is the open problem; T7 and T8 exist to address it.
 
 ## Next
 
-Slice 7 replaces the analyzer's shape, for a reason recorded in full in `agents/PLAN.md`: the graph exists to assemble one ledger entry's complete context, not to be walked by a model, and no fraud scenario may be encoded in code or in a prompt. `prefilter.py`'s six signals and the analyzer's red-flag briefing make the system accurate on this one sample dossier and blind to anything nobody has enumerated yet. In their place: a data-quality gate that decides whether an entry is complete enough to judge, one analyst call per entry over a fully assembled brief, and a refutation-biased verifier that checks each claim against the authoritative records. Alongside it, expose the graph over the API for chat/UI consumption (`GET /api/dossiers/{id}/graphs`, `.../graphs/{graph_id}`), and evaluate against the sealed sample-dossier ground truth with misses attributed to the stage that caused them. See `agents/PLAN.md` and `.codex/skills/dossier-agent-integration/`.
+See `agents/PLAN.md`. In order: re-measure on current `main`, narrow the evaluation's F3 case mapping, close F1's split evidence, then the gate (T7), the verifier (T8), and the graph endpoints (T3).
 
 ## Commands
 
 - Backend: `cd backend && uvicorn app.main:app --reload`
 - Frontend: `cd frontend && npm run dev`
 - Tests: `cd backend && pytest`; `cd frontend && npx vitest run`
-- Agent mode: set `FRAUD_AGENT_ENABLED=true` and `OPENAI_API_KEY`; optionally set `OPENAI_MODEL` (default: `gpt-5.4`), `FRAUD_AGENT_MODEL_CALL_CAP` (default: 500) and `FRAUD_AGENT_MAX_WORKERS` (default: 12).
-
-## Measured performance
-
-On the sample dossier (32,821 normalized records → 41,997 nodes, ~110k edges, 4,902 process graphs), archive to findings on the deterministic path takes about 23s: normalize 6.6s, graph build and persist 12.0s, pre-filter 1.7s, analysis 2.3s.
-
-Agent mode adds model latency on top. The pre-filter admits roughly a third of process graphs, of which only a few dozen carry a strong signal, and traversal runs concurrently. Analyzers pass their in-memory graph into `app/graph/tools.py`, so a traversal costs almost no graph loading; callers without one fall back to a version-validated cache.
+- Agent mode: `FRAUD_AGENT_ENABLED=true` plus `OPENAI_API_KEY`. Optional: `OPENAI_MODEL` (default `gpt-5.4`), the per-stage overrides `FRAUD_AGENT_ANALYST_MODEL` / `FRAUD_AGENT_GATE_MODEL` / `FRAUD_AGENT_VERIFIER_MODEL`, plus `FRAUD_AGENT_MODEL_CALL_CAP` (500) and `FRAUD_AGENT_MAX_WORKERS` (12).
+- Live evaluation: spends real money. Read the `live-eval` skill first.

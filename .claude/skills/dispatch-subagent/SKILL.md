@@ -43,17 +43,30 @@ Subagents do not inherit the session's context, so each of these has to be resta
   nothing. Say plainly in the PR body what did not work.
 - No AI or agent name as commit co-author.
 
-State the exact files the subagent may touch, and which it must not. Give acceptance criteria it
-can check itself, and ask for measured numbers rather than adjectives.
+## 3. Scope it hard - this is the orchestrator's job, not the subagent's
 
-## 3. Dispatch
+A subagent that has to work out *what* to change will read the whole codebase first. That is slow,
+expensive, and produces a worse change than one where the approach was already decided.
+
+- **Name the exact files to read and the exact files to modify.** Say plainly: do not read or edit
+  anything outside this list; if it seems necessary, stop and report back. That instruction works -
+  it has produced a report of a normalization bug instead of an unreviewed fix buried in a diff.
+- **Do not hand over a reading list of context documents.** "Read AGENTS.md, CLAUDE.md,
+  PROJECT_CONTEXT.md, PLAN.md and these six modules" burns tens of thousands of tokens re-deriving
+  what the orchestrator already knows. Put the conclusions in the brief.
+- **One narrow change per dispatch.** Several small tasks beat one large one.
+- **Decide the approach yourself and state it.** Do not delegate open design questions.
+- Give acceptance criteria the subagent can check itself, and ask for measured numbers rather than
+  adjectives.
+
+## 4. Dispatch
 
 ```powershell
 powershell -NoProfile -File <herdr-skill>/scripts/run-subagent.ps1 `
   -Brief <brief.md> -Label <label> -Cwd C:\personal\github\thecez\fd-worktrees\<slice-name> -TimeoutSec 3600
 ```
 
-## 4. Verify - never trust the completion notification
+## 5. Verify - never trust the completion notification
 
 The dispatcher detects completion via "agent went idle", which it cannot distinguish from *stalled
 while waiting*. Three of the first six subagents on this repo finished their code and never

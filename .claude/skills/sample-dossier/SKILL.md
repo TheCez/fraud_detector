@@ -40,6 +40,11 @@ evaluation and must not reach the analyzer. All verified directly against the ar
 | repair-worded assets, all with asset-level postings | `040000-000191`, `040000-000192`, `040000-000194`, `040000-000196`, `060000-000193`, `060000-000195` |
 | asset *group* codes on depreciation rows - must become `account` nodes, not dangling assets | `021000`, `040000`, `060000`, `062000` |
 
+`209101` and `209112` are **vendor** nodes, and every `Kreditor`/`Debitor` row in
+`Stammdatenaenderungen_2025.csv` resolves its `KONTO` to a vendor or customer rather than an account
+(PR #15). Before that fix those numbers were `account` nodes and the master-data change that names a
+party's creator and approver was unreachable from the party itself.
+
 Assert both directions wherever an absence is the signal: that `209101` has no receipt edge **and**
 that `209112` does. Checking only the absence proves nothing - it passes just as well when the
 matching logic is broken entirely.
@@ -57,7 +62,7 @@ from app.normalization.orchestrator import normalize_dossier
 from app.graph.builder import build_graph
 from app.graph.subgraphs import build_process_graphs
 from app.graph.store import save_graph
-from app.analysis.prefilter import select_candidate_graphs
+from app.analysis.profile import build_profile
 from app.analysis.demo_analyzer import DemoAnalyzer
 
 T0 = time.perf_counter()
@@ -77,20 +82,21 @@ process_graphs = build_process_graphs("d1", graph)
 save_graph(db, "d1", graph, process_graphs)
 gr = time.perf_counter() - t
 t = time.perf_counter()
-candidates = select_candidate_graphs("d1", db, graph=graph, process_graphs=process_graphs)
+profile = build_profile("d1", db, graph=graph, process_graphs=process_graphs)
 pf = time.perf_counter() - t
 t = time.perf_counter(); findings = DemoAnalyzer().analyze("d1", db); dm = time.perf_counter() - t
 
-print(f"normalize={norm:.1f} graph={gr:.1f} prefilter={pf:.1f} analysis={dm:.1f} "
+print(f"normalize={norm:.1f} graph={gr:.1f} profile={pf:.1f} analysis={dm:.1f} "
       f"total={time.perf_counter() - T0:.1f}s")
-print(f"graphs={len(process_graphs)} candidates={len(candidates)} findings={len(findings)}")
+print(f"graphs={len(process_graphs)} entities={len(profile.entities)} findings={len(findings)}")
 ```
 
-Pass `graph=` and `process_graphs=` to the pre-filter as above. Omitting them makes it reload the
+Pass `graph=` and `process_graphs=` to `build_profile` as above. Omitting them makes it reload the
 whole graph from SQLite, which measures the wrong thing.
 
-Reference, deterministic path: about 23s total - normalize ~7s, graph ~12s, pre-filter ~2s,
-analysis ~2s.
+Reference, deterministic path: about 23s total - normalize ~7s, graph ~12s, profile ~4s, analysis ~2s.
+To measure what the model actually reads, use the `entry-brief` skill instead; to measure whether it
+finds anything, the `live-eval` skill.
 
 ## Test fixtures
 

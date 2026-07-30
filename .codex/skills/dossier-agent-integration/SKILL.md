@@ -1,30 +1,73 @@
 ---
 name: dossier-agent-integration
-description: Plan or implement work on the local graph engine and the graph-traversing fraud-analysis agent. Use when touching graph construction/persistence (`app/graph/`), the pre-filter or `GraphAnalyzer` (`app/analysis/`), or the evidence store (`app/evidence/`), while preserving evidence-backed findings and existing application contracts.
+description: Plan or implement work on the local graph engine and the per-entry analysis pipeline. Use when touching graph construction or persistence (`app/graph/`), the profile, entry brief, analyst or pipeline stages (`app/analysis/`), or the evidence store (`app/evidence/`), while preserving evidence-backed findings and existing application contracts.
 ---
 
-# Graph Engine and Graph-Traversing Agent
+# Graph engine and the per-entry analysis pipeline
 
-Read `PROJECT_CONTEXT.md`, `agents/PLAN.md`, and the affected backend modules first.
+Read `PROJECT_CONTEXT.md` and `agents/PLAN.md` first, then only the modules your task names.
 
-Keep `Analyzer` (`app/analysis/interface.py`) as the seam. Do not alter upload, extraction, normalization, evidence, persistence, or dashboard contracts unless the change is required and covered end to end.
+Keep `Analyzer` (`app/analysis/interface.py`) as the seam. Do not alter upload, extraction,
+normalization, evidence, persistence or dashboard contracts unless the change is required and covered
+end to end.
 
-## Architecture
+## The shape, and the reason for it
 
-- `app/graph/builder.py` builds a `networkx.MultiDiGraph` from normalized records already in SQLite - no LLM, no network calls, fully deterministic.
-- `app/graph/subgraphs.py` enumerates per-transaction process graphs (clusters of related records) from that graph.
-- `app/graph/store.py` persists both to SQLite and loads them back losslessly.
-- `app/graph/tools.py` is the bounded, dossier-scoped, typed query API - the only way anything (the fraud-analysis agent today, a findings chat agent later) is allowed to read the graph. Every function returns plain serializable data and enforces an explicit limit; nothing pulls an entire dossier into a prompt through this API.
-- `app/analysis/prefilter.py` is a cheap, deterministic, recall-oriented filter that decides which process graphs are worth a model call, given the graph engine can produce thousands of them per dossier. It must stay generous - narrowing it until only genuinely fraudulent graphs pass would quietly turn it into the rule engine this project's owner explicitly rejected in favor of LLM traversal.
-- `app/analysis/graph_analyzer.py`'s `GraphAnalyzer` walks pre-filter-selected process graphs with bounded LangGraph agents, using only the `app/graph/tools.py` API, under a hard per-graph step budget, a hard per-run model-call cap (`AgentSettings.model_call_cap`), and a bounded worker pool (`AgentSettings.max_workers`). Two properties are load-bearing and easy to break: candidates are **ranked** by signal specificity so the cap truncates the weakest rather than an arbitrary slice, and findings are **sorted deterministically** so concurrent completion order never leaks into the result.
-- Analyzers pass their already-built graph into the tool functions. Every `tools.py` call would otherwise rebuild the whole graph from SQLite - and since that is GIL-bound pure-Python work, concurrency cannot hide it. Callers with no graph to hand in fall back to a cache validated against a version counter bumped inside the same transaction as each graph rewrite.
-- `app/evidence/store.py`'s `EvidenceRecordStore` is the authoritative evidence store both `DemoAnalyzer` and `GraphAnalyzer` rehydrate findings from. It is the correctness guarantee: findings are rebuilt from dossier-scoped SQLite records, never from model output.
+**One process graph is one ledger entry. The graph assembles that entry's complete context before the
+model is called; a model never walks it.** An earlier design gave the analyst six traversal tools and a
+6-call step budget, so it spent its attention navigating and frequently judged an entry before reaching
+its full context. Assembly is the system's job.
+
+- `app/graph/builder.py` builds a `networkx.MultiDiGraph` from normalized records already in SQLite -
+  no LLM, no network, fully deterministic.
+- `app/graph/subgraphs.py` enumerates process graphs, clustered by `document_join` rather than raw
+  connected components. High-degree entity nodes would otherwise glue the dossier into one component.
+- `app/graph/store.py` persists and reloads both losslessly, deleting before inserting so a rebuild can
+  never serve a stale graph.
+- `app/graph/tools.py` is the bounded, dossier-scoped, typed query API. The analyzer no longer uses it;
+  it is the sanctioned read path for the graph endpoints and a future chat agent. Every function
+  enforces an explicit limit.
+- `app/analysis/profile.py` computes a `DossierProfile` in one pass over records and one over edges.
+  Counts only, all learned from the dossier in front of it - per-entity counts including a **zero** count
+  per edge type, per-shape statistics, per-entry completeness facts, amount quantiles. This is what
+  replaced the deleted rule engine: "this vendor participates in 0 `has_receipt` edges" is a measured
+  fact about the dossier, not a pattern someone authored.
+- `app/analysis/entry_brief.py` renders one entry as bounded **text**, not nested JSON. Sections: the
+  entry, a chronological timeline, every record with fields and provenance, the parties with their
+  profiles and their own master-data records, the relationships, what peer entries of the shape carry
+  that this one lacks, and the number and date conventions.
+- `app/analysis/analyst.py` makes exactly one structured-output call per entry. No tools bound.
+- `app/analysis/pipeline.py` orchestrates: build the profile once, order entries, then per entry render,
+  call, rehydrate, validate. It carries the worker pool, per-entry failure isolation, the model-call cap,
+  and deterministic finding ids and ordering.
+- `app/evidence/store.py` is the authoritative evidence store every analyzer rehydrates from.
 
 ## Non-negotiable trust boundary
 
-1. Ingest normalized records into local SQLite; `app/graph/builder.py` builds the graph from there.
-2. The pre-filter decides *whether to look*, never *whether it is fraud* - judgement stays with the model.
-3. `GraphAnalyzer` walks a selected process graph with structured outputs constrained to `ProposedFinding` - a type with **no evidence field**, so the model cannot express evidence text, only cite `record_ids`.
-4. `EvidenceRecordStore` rehydrates every cited `record_id` from this dossier's SQLite records. A proposal is discarded **whole** if any cited id fails to resolve - never partially accepted.
-5. Persist only findings whose every factual claim maps to rehydrated evidence.
-6. Provide an explicit unavailable/degraded state (`GraphUnavailableError` -> `analysis_incomplete`) when credentials, the optional LangGraph/LangChain dependencies, or the graph build are unavailable. Never fabricate evidence, expose secrets, or let model output touch the graph or SQLite directly instead of through `app/graph/tools.py`.
+1. Normalized records go into local SQLite; `builder.py` builds the graph from there.
+2. The analyst receives one assembled brief and answers once. Structured output is constrained to
+   `ProposedFinding` - a type with **no evidence field**, so the model cannot express evidence text at
+   all, only cite `record_ids`.
+3. `EvidenceRecordStore` rehydrates every cited id from this dossier's records. A proposal is discarded
+   **whole** if any cited id fails to resolve - never partially accepted.
+4. Persist only findings whose every factual claim maps to rehydrated evidence.
+5. Provide an explicit degraded state (`GraphUnavailableError` -> `analysis_incomplete`) when
+   credentials, an optional dependency, or the graph build are unavailable. Never fabricate evidence,
+   expose secrets, or let model output reach the graph or SQLite directly.
+
+## Two rules that are easy to break
+
+**No fraud scenario in code or in a prompt.** No keyword lists, no amount thresholds, no named
+patterns, no worked examples. `tests/fraud_scenario_guard.py` enforces this with an AST walk plus a
+prompt-text check, and it has its own tests. A check about *data quality* is exempt - it asserts nothing
+about wrongdoing - but it may only route an entry **toward** analysis, never away from it.
+
+**Nothing narrows silently.** A model-call cap, a gate rejection, a refuted finding: each is recorded on
+the analysis run with counts. Entry ordering may reorder but never exclude.
+
+## Before claiming a change helped
+
+Offline tests prove properties, not usefulness. Use the `entry-brief` skill to read what the model
+actually receives, and the `live-eval` skill to measure whether it finds anything. A hypothesis about
+model behaviour is worthless until the brief has been read - one missed finding was blamed on the model
+for two rounds before turning out to be a parser typing bug.
