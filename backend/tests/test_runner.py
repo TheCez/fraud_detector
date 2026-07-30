@@ -127,7 +127,7 @@ def test_model_failure_leaves_dossier_incomplete_with_no_partial_findings(tmp_pa
     def _boom(self, dossier_id, db_path):
         raise RuntimeError("simulated model failure")
 
-    monkeypatch.setattr("app.analysis.runner.GraphAnalyzer.analyze", _boom)
+    monkeypatch.setattr("app.analysis.runner.AnalysisPipeline.analyze", _boom)
 
     run_analysis(dossier_id, tmp_path / "workspace", db_path)
 
@@ -146,15 +146,15 @@ def test_model_call_cap_hit_completes_the_run_but_records_the_message(tmp_path: 
     dossier_id = "dossier-cap-hit"
     _seed_dossier(db_path, dossier_id)
 
-    class _CappedAnalyzer:
+    class _CappedPipeline:
         def __init__(self, settings, *, graph=None, process_graphs=None) -> None:
             self.model_call_cap_hit = True
-            self.cap_message = "Model-call cap (2) reached: 5 of 5 process graphs..."
+            self.cap_message = "Model-call cap (2) reached: 5 of 5 ledger entries..."
 
         def analyze(self, dossier_id, db_path):
             return []
 
-    monkeypatch.setattr("app.analysis.runner.GraphAnalyzer", _CappedAnalyzer)
+    monkeypatch.setattr("app.analysis.runner.AnalysisPipeline", _CappedPipeline)
 
     run_analysis(dossier_id, tmp_path / "workspace", db_path)
 
