@@ -15,6 +15,7 @@ import pytest
 from app.ingestion.manifest import ACCOUNTING_FOLDERS, build_manifest
 from app.models.schemas import FileClassification, ParseStatus
 from app.normalization.orchestrator import normalize_dossier
+from app.normalization.parsers.csv_parser import parse_csv_file
 from app.normalization.parsers.gdpdu_txt import parse_gdpdu_folder
 from tests.conftest import SAMPLE_DOSSIER_ID, requires_sample_zip
 
@@ -244,3 +245,43 @@ def test_vendor_postings_have_no_fabricated_posted_by(normalized):
     assert vendor_postings
     for record in vendor_postings:
         assert "posted_by" not in record.relationships
+
+
+# ---------------------------------------------------------------------------
+# Work item 4: KONTO resolves to the subledger its own row names
+# ---------------------------------------------------------------------------
+
+
+@requires_sample_zip
+def test_vendor_master_change_row_resolves_konto_to_vendor_not_account(normalized):
+    """Stammdatenaenderungen_2025.csv carries a row with ART=Kreditor and
+    KONTO=209101 - that account number is a vendor, so the master_change
+    record must connect to vendor:209101, not a phantom account:209101, while
+    changed_by/approved_by (which travel via the separate relationships dict)
+    are untouched."""
+    _manifest, records = normalized
+    master_change = next(
+        r
+        for r in records
+        if r.record_type.value == "master_change"
+        and any(e.entity_id == "209101" for e in r.entities)
+    )
+    entity_types = {(e.entity_type, e.entity_id) for e in master_change.entities}
+    assert ("vendor", "209101") in entity_types
+    assert ("account", "209101") not in entity_types
+    assert master_change.relationships.get("changed_by") == "MV-U05"
+    assert master_change.relationships.get("approved_by") == "MV-U05"
+
+
+def test_konto_column_without_a_discriminator_column_still_yields_account(tmp_path: Path):
+    """A row with no type-discriminator column (e.g. no ART column) keeps
+    today's behaviour exactly - KONTO still resolves to a generic account."""
+    csv_path = tmp_path / "Sonstiges.csv"
+    csv_path.write_text(
+        "DATUM;KONTO;BETRAG\n12.05.2025;660000;100,00\n",
+        encoding="cp1252",
+    )
+    records = parse_csv_file(csv_path, "Sonstiges.csv", "no-discriminator-dossier", "file-1")
+    assert len(records) == 1
+    entity_types = {(e.entity_type, e.entity_id) for e in records[0].entities}
+    assert ("account", "660000") in entity_types
