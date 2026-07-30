@@ -480,3 +480,49 @@ def _check_module_for_fraud_scenario_shape(source_path: Path) -> list[str]:
 def test_no_encoded_fraud_scenario(source_path: Path):
     violations = _check_module_for_fraud_scenario_shape(source_path)
     assert not violations, f"{source_path.name} has fraud-scenario-shaped code:\n" + "\n".join(violations)
+
+
+# The guard above is the only mechanical enforcement of this project's central
+# rule (`agents/PLAN.md`: no fraud scenario may be encoded in code or in a
+# prompt), and it is non-trivial code in its own right - three AST rules and
+# two allowlists. An AST walk that silently matched nothing would let every
+# future violation through while still reporting a green suite, which is
+# exactly the failure mode the guard exists to prevent. So the guard is itself
+# tested: each rule must fire on a reintroduced violation of the shape the
+# deleted `prefilter.py` used, and clean code must stay clean.
+_GUARD_CASES = [
+    pytest.param(
+        '_REPAIR_KEYWORDS = ("reparatur",)\n',
+        "domain-judgement-shaped name",
+        id="rule1-name-shaped-constant",
+    ),
+    pytest.param(
+        '_WORDS = ("renovierung", "sanierung", "umbau")\n',
+        "domain-vocabulary shape",
+        id="rule3-new-keyword-list-the-old-denylist-would-have-missed",
+    ),
+    pytest.param(
+        "_LIMITS = (2_500.0, 7_500.0)\n",
+        "at/above the modest bound",
+        id="rule2-threshold-the-old-denylist-would-have-missed",
+    ),
+]
+
+
+@pytest.mark.parametrize("source,expected_message", _GUARD_CASES)
+def test_the_fraud_scenario_guard_fires_on_a_reintroduced_violation(
+    tmp_path: Path, source: str, expected_message: str
+):
+    module_path = tmp_path / "reintroduced.py"
+    module_path.write_text(source, encoding="utf-8")
+    violations = _check_module_for_fraud_scenario_shape(module_path)
+    assert violations, f"guard did not fire on:\n{source}"
+    assert any(expected_message in violation for violation in violations), (
+        f"guard fired but not for the expected reason ({expected_message!r}): {violations}"
+    )
+
+
+def test_the_fraud_scenario_guard_passes_code_with_no_domain_vocabulary(tmp_path: Path):
+    module_path = tmp_path / "clean.py"
+    module_path.write_text('MAX_ROWS = 3\nLABEL = "record"\n', encoding="utf-8")
+    assert _check_module_for_fraud_scenario_shape(module_path) == []
